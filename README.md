@@ -63,4 +63,53 @@ Token 节省：平均每会话节省约 78% 的 Token，通过精准召回替代
 
 请你理解上述内容，并且分析本项目中，哪些上述功能实现了，哪些没实现，实现了的又有哪些不同
 
+tooluse孤儿问题：
+防线一：同进程内工具执行被 interrupt（StreamingExecutor）
+  工具执行线程被中断时，StreamingExecutor 捕获 InterruptedException 并补一个错误结果（StreamingExecutor.java:122-124）：
 
+  catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      results.add(new ToolExecResult(call.toolId(), "Error: interrupted", true));  // 闭合配对
+  }
+
+  防线二：Agent 主循环被外部取消（用户 Ctrl+C / 中断）
+工具根本还没执行完，agent 也没来得及写 result。看 MewCodeModel.java:1643-1664 的中断处理：
+
+runningAgent.cancel();                              // 停掉 agent 循环线程
+...
+Thread.ofVirtual().name("agent-interrupt-repair").start(() -> {
+    runningAgent.awaitTermination(5000);
+    if (oldQueue != null) oldQueue.clear();
+    conversation.repairDanglingToolUses();          // ← 关键：修补孤儿配对
+});
+
+还有两处同样的关切
+fork 路径：AgentTool.buildForkedConversation 对"带了 pending tool_use 但没结果"的 assistant 消息补 "(tool execution interrupted by fork)" 占位（AgentTool.java:365-371）。
+上下文压缩：ContextCompactor.java:404,433 在压缩时也会避免把 tool_use/tool_result 这对拆开丢掉一半，防止压缩后留下孤儿。
+
+tooluse不完整问题（json不完整）：
+
+场景A：流正常读到 EOF，但没发 [DONE]（干净断流）
+比如对端发了 Connection: close 关掉 socket，readLine() 返回 null，while 正常退出 → 走安全网 flushPendingToolCalls。
+
+此时参数是半截 JSON，flushPendingToolCalls 里专门有 try/catch 兜底（OpenAiCompatClient.java:311-318）：
+
+try {
+    args = MAPPER.readValue(rawArgs, Map.class);   // 半截 JSON 会抛异常
+} catch (Exception e) {
+    args = Map.of();                                // 解析失败 → 空参数
+}
+queue.put(new StreamEvent.ToolCallComplete(callId, name, args));
+结果：半截工具调用被当成"一个参数为空的完整调用"发出去 → Agent.agentLoop 收集到该 ToolCallInfo → StreamingExecutor 执行它。
+
+执行时怎么办：空参数意味着必填参数缺失，工具通常返回 ToolResult.error("missing required arg ...")（如 AgentTool.java:269 的 description/prompt 校验）。这个错误作为"观察结果"回灌对话 → ReAct 进入下一轮 → 模型看到错误后自行修正/重新发起。所以这种"半截"不会硬崩，而是"执行失败→观察→自我纠正"。
+
+场景B：抛 IOException（硬网络中断）
+readLine() 直接抛异常 → doStream 的异常冒泡到 stream() 的 catch（OpenAiCompatClient.java:86），只发一个 StreamEvent.Error(...)：
+
+queue.put(new StreamEvent.Error(classifyError(e).getMessage()));
+此时没有 StreamEnd，也没有 ToolCallComplete。Agent.agentLoop 收到 Error 走 streamError 分支（Agent.java:416-445）：
+
+若是可重试错误（context too long / rate limit）→ continue 重试
+否则 break 结束回合 → 半截工具调用直接丢弃（因为 conv.addAssistantFull(...) 在错误检查之后才执行，Agent.java:479，根本没加到对话里）
+硬错误下，局部变量 toolCalls 里的半截调用从未进对话、也从未执行，被静默丢弃。循环的 finally 补发一个 LoopComplete(0)（Agent.java:540-543），保证有终态。
