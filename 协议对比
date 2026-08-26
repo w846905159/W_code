@@ -1,0 +1,142 @@
+基于源码逐行对比（已读完三个 Client 的请求构造与流式解析），下面给出三种协议在 **request 消息格式**与 **response SSE 流式格式**的具体对比。
+
+---
+
+## 一、Request 请求消息格式
+
+### 1. anthropic — `AnthropicClient`（Claude Messages API）
+构造于 `AnthropicClient.java:117-140`，走官方 SDK `messages().createStreaming(...)`：
+
+```java
+MessageCreateParams.builder()
+    .model(model)
+    .maxTokens(maxOutputTokens)
+    .system([{text, cache_control:{type:ephemeral}}])   // 系统提示=system 块，带缓存标记
+    .messages([...])                                     // 角色消息数组
+    .thinking(ThinkingConfigEnabled/Adaptive)            // 可选
+    .tools([{name, description, input_schema}])          // 工具=裸 schema
+```
+
+- **消息单元**：`messages[]`，每条是 `{role, content}`，content 是 **blocks 数组**（可混含 text / tool_use / tool_result / thinking 块）。
+- **系统提示**：独立的 `system` 顶层字段（也是 blocks），非消息。
+- **工具结果**：作为 user 消息里的 `tool_result` block，`tool_use_id` 关联。
+- **工具 schema**：**裸格式** `{name, description, input_schema}`，无 `type` 包装。
+- **thinking**：顶层 `thinking` 配置（budgetTokens 或 adaptive）。
+
+### 2. openai — `OpenAiClient`（OpenAI Responses API）
+构造于 `OpenAiClient.java:75-91`，走官方 SDK `responses().createStreaming(...)`：
+
+```java
+ResponseCreateParams.builder()
+    .model(model)
+    .instructions(systemPrompt)                  // 系统提示=instructions 字段
+    .inputOfResponse([items...])                 // 输入=items 数组，不是 messages[]
+    .reasoning({effort:HIGH, summary:DETAILED})  // thinking 走 reasoning 参数
+    .addTool(FunctionTool{name, description, parameters})
+```
+
+- **消息单元**：`input[]`，每项是一个 **item**，类型多样：
+  - `easy_input_message`（role: user/assistant, content 文本）
+  - `function_call`（{call_id, name, arguments}）—— 表示 assistant 发的工具调用
+  - `function_call_output`（{call_id, output}）—— 表示工具结果
+- **系统提示**：顶层 `instructions` 字段，不是消息。
+- **工具结果**：独立的 `function_call_output` item，靠 `call_id` 关联。
+- **工具 schema**：`FunctionTool`（内部 `{type:"function", function:{name, description, parameters}}`），由 `buildFunctionTool` 从裸 schema 重包装。
+- **thinking**：顶层 `reasoning` 参数（effort）。
+
+### 3. openai-compat — `OpenAiCompatClient`（OpenAI Chat Completions）
+构造于 `OpenAiCompatClient.java:353-373`，裸 httpClient POST `/chat/completions`：
+
+```json
+{
+  "model": ...,
+  "stream": true,
+  "max_tokens": ...,
+  "stream_options": {"include_usage": true},
+  "messages": [
+    {"role":"system","content":...},
+    {"role":"user","content":...},
+    {"role":"assistant","content":...,"tool_calls":[{id,type:"function",function:{name,arguments}}]},
+    {"role":"tool","tool_call_id":...,"content":...}
+  ],
+  "tools": [{"type":"function","function":{"name","description","parameters"}}]
+}
+```
+
+- **消息单元**：`messages[]`，每条 `{role, content}`，经典四角色 `system/user/assistant/tool`。
+- **系统提示**：`messages[]` 里的一条 `role:"system"` 消息（`buildChatMessages` 首条）。
+- **工具结果**：**独立的 `role:"tool"` 消息** + `tool_call_id` 关联（`OpenAiCompatClient.java:420-428`）。
+- **工具 schema**：`tools` 数组，`{type:"function", function:{name, description, parameters}}`，由 `buildToolsArray` 重包装。
+- **thinking**：**无请求侧参数**，只有响应侧被动解析。
+
+---
+
+## 二、Response SSE 流式消息格式
+
+### 1. anthropic — 官方 SDK 类型化事件
+`AnthropicClient.java:158-235`，消费 `RawMessageStreamEvent`：
+
+| SDK 事件类型 | 含义 | 映射 |
+|---|---|---|
+| `message_start` | 消息开始，含 usage(input/cache_read) | 累计 token |
+| `content_block_start` | 内容块开始：`thinking` 或 `tool_use` | thinking→记录 / tool_use→`ToolCallStart` |
+| `content_block_delta` | 块增量：`thinking_delta` / `signature_delta` / `text_delta` / `input_json_delta` | thinking→`ThinkingDelta`，json→`ToolCallDelta` |
+| `content_block_stop` | 块结束 | thinking→`ThinkingComplete`，tool_use→「**拼完 JSON 后**」`ToolCallComplete` |
+| `message_delta` | stop_reason + usage(output/cache) | 记 stop_reason/token |
+
+- **工具收尾**：靠 `content_block_stop` 事件 + 内部累加 JSON 后解析出完整 args（`AnthropicClient.java:187-207`）。**有显式的"块结束"事件**定位每个工具边界。
+
+### 2. openai — Responses API 类型化事件
+`OpenAiClient.java:106-156`，消费 `ResponseStreamEvent`：
+
+| SDK 事件类型 | 含义 | 映射 |
+|---|---|---|
+| `output_text_delta` | 文本增量 | `TextDelta` |
+| `output_item_added` | 新增 item：`function_call` / `reasoning` | function_call→`ToolCallStart`，reasoning→记录 |
+| `function_call_arguments_delta` | 某工具参数增量 | `ToolCallDelta` |
+| `function_call_arguments_done` | **单个工具参数收尾（显式 done）** | 拼 JSON 出 `ToolCallComplete` |
+| `reasoning_summary_text_delta` / `.done` | 思维摘要 | `ThinkingDelta` / `ThinkingComplete` |
+| `completed` | 流结束，带 usage | `StreamEnd` |
+
+- **工具收尾**：**`function_call_arguments_done` 显式收尾**每个工具调用（带 call_id），最精准（`OpenAiClient.java:124-136`）。
+
+### 3. openai-compat — 手写解析原始 SSE `data:` 行
+`OpenAiCompatClient.java:130-148` + `handleSseData`（`:176-273`），逐行读 `data:` 再 `readTree` 解析 JSON：
+
+| SSE chunk（`choices[0].delta` 内） | 含义 | 映射 |
+|---|---|---|
+| `delta.content` | 文本增量 | `TextDelta` |
+| `delta.reasoning` / `delta.reasoning_content` | 思维增量（各家网关不同字段） | `ThinkingDelta` |
+| `delta.tool_calls[]`（含 `index`/`id`/`function.name`/`function.arguments` 增量） | 工具调用增量 | `ToolCallStart` / `ToolCallDelta` |
+| `finish_reason:"tool_calls"` | **触发手动 flush** 累加的工具调用 | `ToolCallComplete` |
+| `finish_reason:"stop"/"length"` | 文本结束 | 记 stop_reason |
+| `usage` | 每 chunk 累计 | 记 token |
+| `data:[DONE]` | 流结束标记 | `StreamEnd`（+ 兜底 flush） |
+
+- **工具收尾**：**没有逐工具的 done 事件**，靠 `finish_reason=="tool_calls"`（或 `[DONE]`）触发 `flushPendingToolCalls()` 把跨 chunk 累加的 JSON 一次性转成完整调用（`OpenAiCompatClient.java:265`）。
+
+---
+
+## 三、横向对比总结
+
+| 维度 | anthropic | openai (Responses) | openai-compat (Chat Completions) |
+|---|---|---|---|
+| 请求 URL/API | `messages` SDK | `responses` SDK | `/chat/completions`（裸 HTTP） |
+| 系统提示 | 顶层 `system` blocks | 顶层 `instructions` | `messages[]` 里 `role:"system"` |
+| 对话主体 | `messages[]` + content blocks | `input[]` items | `messages[]` roles |
+| 工具结果单元 | `tool_result` block（user 消息内） | `function_call_output` item | `role:"tool"` 独立消息 |
+| 工具 schema | 裸 `{name,description,input_schema}` | `FunctionTool{type:function,...}` | `tools[]{type:function,function:{...}}` |
+| thinking 请求 | `thinking` 配置 | `reasoning.effort` | 无请求参数 |
+| 流式事件单元 | content_block_start/delta/stop | output_item_added / *_delta / done | SSE `choices[].delta` chunks |
+| 单工具收尾 | `content_block_stop`（拼 JSON） | `function_call_arguments_done` | `finish_reason=tool_calls` 手动 flush |
+| thinking 响应 | `thinking_delta` + `signature` | `reasoning_summary_text` | `delta.reasoning`/`reasoning_content` |
+| 流结束 | `message_delta` + 自然结束 | `completed` 事件 | `data:[DONE]` + 安全网兜底 |
+| usage | message_start/message_delta | `completed().response.usage()` | 每 chunk `usage` 累计 |
+
+## 一句话定性
+
+- **anthropic**：block 结构（content 由 text/tool_use/tool_result/thinking 块组成），工具收尾靠"块停止"事件。
+- **openai**：item 结构（输入/输出全是 items 序列），工具收尾靠显式 `function_call_arguments_done`，thinking 由请求参数显式控制。
+- **openai-compat**：经典 role-messages 结构，工具靠 `finish_reason=tool_calls` 手动 flush，thinking 服务器端驱动被动解析——典型 OpenAI 一代 Chat Completions 语义。
+
+三者最终都以统一的 `StreamEvent`（TextDelta/ThinkingDelta/ToolCallStart/Delta/Complete/StreamEnd/Error）汇入 `Agent.agentLoop`，差异全在各自的"方言层"被消化掉了。
