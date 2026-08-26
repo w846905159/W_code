@@ -7,15 +7,46 @@
 ### 1. anthropic — `AnthropicClient`（Claude Messages API）
 构造于 `AnthropicClient.java:117-140`，走官方 SDK `messages().createStreaming(...)`：
 
-```java
-MessageCreateParams.builder()
-    .model(model)
-    .maxTokens(maxOutputTokens)
-    .system([{text, cache_control:{type:ephemeral}}])   // 系统提示=system 块，带缓存标记
-    .messages([...])                                     // 角色消息数组
-    .thinking(ThinkingConfigEnabled/Adaptive)            // 可选
-    .tools([{name, description, input_schema}])          // 工具=裸 schema
-```
+{
+  "model": "claude-sonnet-4-5",
+  "max_tokens": 8192,
+  "system": [
+    {
+      "type": "text",
+      "text": "You are a helpful coding assistant.",
+      "cache_control": { "type": "ephemeral" }
+    }
+  ],
+  "messages": [
+    { "role": "user", "content": "帮我读一下 src/a.java" },
+    {
+      "role": "assistant",
+      "content": [
+        { "type": "text", "text": "让我查看这个文件。" },
+        {
+          "type": "tool_use",
+          "id": "toolu_01ABC",
+          "name": "ReadFile",
+          "input": { "file_path": "src/a.java" }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01ABC",
+          "content": "public class A { ... }"
+        }
+      ]
+    }
+  ],
+  "tools": [
+    { "name": "ReadFile", "description": "读取文件内容", "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } }, "required": ["file_path"] } }
+  ],
+  "thinking": { "type": "enabled", "budget_tokens": 4096 }
+}
 
 - **消息单元**：`messages[]`，每条是 `{role, content}`，content 是 **blocks 数组**（可混含 text / tool_use / tool_result / thinking 块）。
 - **系统提示**：独立的 `system` 顶层字段（也是 blocks），非消息。
@@ -25,15 +56,38 @@ MessageCreateParams.builder()
 
 ### 2. openai — `OpenAiClient`（OpenAI Responses API）
 构造于 `OpenAiClient.java:75-91`，走官方 SDK `responses().createStreaming(...)`：
-
-```java
-ResponseCreateParams.builder()
-    .model(model)
-    .instructions(systemPrompt)                  // 系统提示=instructions 字段
-    .inputOfResponse([items...])                 // 输入=items 数组，不是 messages[]
-    .reasoning({effort:HIGH, summary:DETAILED})  // thinking 走 reasoning 参数
-    .addTool(FunctionTool{name, description, parameters})
-```
+{
+  "model": "gpt-4o",
+  "instructions": "You are a helpful coding assistant.",
+  "input": [
+    { "role": "user", "content": "帮我读一下 src/a.java" },
+    {
+      "role": "assistant",
+      "content": "让我查看这个文件。"
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_01ABC",
+      "name": "ReadFile",
+      "arguments": "{\"file_path\": \"src/a.java\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_01ABC",
+      "output": "public class A { ... }"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "ReadFile",
+      "description": "读取文件内容",
+      "parameters": { "type": "object", "properties": { "file_path": { "type": "string" } }, "required": ["file_path"] },
+      "strict": false
+    }
+  ],
+  "reasoning": { "effort": "high", "summary": "detailed" }
+}
 
 - **消息单元**：`input[]`，每项是一个 **item**，类型多样：
   - `easy_input_message`（role: user/assistant, content 文本）
