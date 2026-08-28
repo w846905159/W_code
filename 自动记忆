@@ -1,0 +1,146 @@
+别乱，我把这几个"存文件信息的地方"一次性理清楚。它们其实是**三种不同的东西，各管各的**：
+
+## 三类数据结构，分工不同
+
+| 结构 | 存在哪 | 生命周期 | 存的什么 | 作用 |
+|---|---|---|---|---|
+| **磁盘 `.md` 文件** | `userMemDir` / `projectMemDir` | 永久 | 全文内容 + frontmatter(type/description) | 记忆的**唯一事实来源**（真正的数据） |
+| **`MemoryHeader`** | 内存（临时对象） | **每次扫描都重新生成**，用完即丢 | 一个磁盘文件的快照：filename、filePath(绝对路径)、scope、mtimeMs、description、type | 扫描磁盘时的"读侧视图"，给召回/向量化当输入 |
+| **`indexedMemoMtime`** | 内存（`MewCodeModel` 的字段） | **随会话存活**（一次会话内一直记着） | `Map<filePath, 上次索引时的 mtime>` | **去重账本**：记住"哪个文件已经入库过、当时的修改时间" |
+| **Lucene 索引** | `.mewcode/memory-vec`（磁盘） | 永久 | 每个 filePath 一条向量（embedding + metadata + 内容副本） | 真正的向量数据，粗筛时用来算相似度 |
+
+## 关键区分一句话
+
+- `MemoryHeader` 是**每次现扫磁盘**临时拷出来的"镜子"，不是存储——它每次调用都从磁盘重新读。
+- `indexedMemoMtime` 才是**跨扫描的记忆**，它记的是"我上次已经处理到哪个程度"，专门用来避免重复入库。
+- Lucene 才是**真正落盘的向量**。
+
+## 它们是怎么配合的（避免重复入库的那段）
+
+拿"每 5 轮新增一个 md 文件"为例，`refreshMemoryEmbeddings()`（`MewCodeModel.java:1432`）：
+
+```
+① 扫磁盘 → 得到一批 MemoryHeader（当前磁盘的镜子）
+      new file: 20260828-150523-123-project.md   [MemoryHeader: 临时对象]
+
+② 对每个 header，拿它的 filePath 去查 indexedMemoMtime 账本           mtimeMs = Files.getLastModifiedTime(filePath).toMillis(); 拿到的是磁盘上此刻最新的 mtime（不是缓存值，现扫现读）。
+                                                                          
+      indexedMemoMtime.get("...123-project.md")  → null（从没入库过）
+      → 决定入库
+
+③ 入库到 Lucene（先 deleteByPath 再 insert，保证一个 filePath 只一条向量）
+
+④ 记账：indexedMemoMtime.put(filePath, 文件当前的 mtime)
+      → 下一次扫描同一个文件时，② 查到 prev != null 且 mtime 没变
+      → 跳过，不入库
+```
+
+所以三者角色不同，但通过 **filePath** 这个"共同主键"串起来：
+- **filePath 是关联键**：MemoryHeader 里带着它、indexedMemoMtime 用它当 map 的 key、Lucene 用它做 source 键。
+- **mtime 是变化探测**：值放在 MemoryHeader 里给出来，记进 indexedMemoMtime 账本里比较。
+- **MemoryHeader 是数据搬运工**：它只是把磁盘信息带到这一步，本身不存储、不入库。
+
+一句话总结：**磁盘是数据源，MemoryHeader 是临时快照（镜子），indexedMemoMtime 是防重复的账本（记 mtime），Lucene 是算向量的存储；它们靠 filePath 对齐，靠 indexedMemoMtime 里的 mtime 判断该不该再入库。**
+
+
+召回：
+
+召回侧从"用户提问"触发，到"记忆注入对话"结束。主入口是 `prefetchRelevantMemories()`（`MewCodeModel.java:1508`），核心逻辑在 `MemoryRecall.findRelevantMemories()`（`MemoryRecall.java:124`）。下面是完整流水线。
+
+## 召回的完整链路
+
+### ① 触发时机（异步，不阻塞主流程）
+用户每发一条消息，`sendUserMessage()` 就启动一次召回（`MewCodeModel.java:1266`）：
+```java
+var prefetchFuture = prefetchRelevantMemories(userText);
+```
+跑在虚拟线程里（8 秒超时，`MewCodeModel.java:1550`），不会拖慢主对话。它用一个**独立的 side-client LLM** 做选择，跟主对话的 system prompt 完全隔离。
+
+### ② 扫描两个记忆目录 → 候选清单
+`findRelevantMemories`（`MemoryRecall.java:136-152`）先扫**用户级 + 项目级**两个目录：
+```java
+all.addAll(MemoryScanner.scanMemoryFiles(userMemDir, "user"));
+all.addAll(MemoryScanner.scanMemoryFiles(projectMemDir, "project"));
+```
+得到全部 `MemoryHeader`（默认最多 200 条，新的在前）。然后**过滤掉已经展示过的**（`alreadySurfaced`，避免同一段记忆反复刷屏，`MemoryRecall.java:145-152`），剩下的才是候选。
+
+### ③ 阶段一：向量粗筛（可选，降 token）
+候选太多时，用向量把 200 条缩到 top-20（`MemoryRecall.java:154-167`）：
+```java
+if (memoryStore != null) {
+    stageCandidates = vectorPrefilter(memoryStore, query, candidates, TOP_K);
+} else if (embeddingService != null && candidates.size() > 20) {
+    stageCandidates = rankByEmbedding(...);
+}
+```
+- 优先用持久化 `MemoryEmbeddingStore.searchTopK`（算相似度，返回命中 filePath）。
+- 否则用 RAG 的 `EmbeddingService` 现场算 cosine 取 top-20。
+- 候选 ≤20 条时连粗筛都可以跳过（不划算）。
+- **任何一步失败都优雅降级**：直接返回全量候选，不阻塞。
+
+### ④ 阶段二：LLM 精筛（selector 挑 5 条）
+对上一步的候选，`selectRelevantMemories`（`MemoryRecall.java:291`）：
+1. 用 `formatMemoryManifest` 把候选 header 拼成**元数据清单**（filename + scope/type + 时间 + description，`MemoryScanner.java:188`）。
+2. 拼一个 user message：`Query: <用户问题> \n\n Available memories:\n <清单> (+ 最近用过的工具)`。
+3. 调 `selector.select(系统提示, userMessage)`，系统提示是 `SELECTOR_SYSTEM_PROMPT`（`MemoryRecall.java:32`），要求：
+   - 只挑"确定有用"的，最多 **5 条**；
+   - 不确定就排除，宁可空列表；
+   - 若给了已用工具，**跳过这些工具的使用说明/API 文档类记忆，但仍要选警告/坑/已知问题类**（正在用工具时恰恰最该提醒）。
+4. 让模型返回严格 JSON：`{"selected_memories": ["a.md","b.md"]}`。用 `extractJsonObject` 容错解析 markdown 包裹（`MemoryRecall.java:344`），最后**只保留在合法文件名集合里**的（防模型幻觉乱编文件名）。
+
+### ⑤ 映射回 header → 读全文
+`buildResults`（`MemoryRecall.java:200`）把选中的文件名映射回对应 header 的 `filePath` + `mtimeMs`（支持按绝对路径和文件名两种匹配）。
+
+### ⑥ 渲染成 system-reminder
+`renderReminder`（`MemoryRecall.java:364`）读每个选中文件的**全文**，拼成带新鲜度提示的文本：
+```
+The following relevant memories from prior conversations may help:
+
+## Memory: 20260828-...-project.md (saved 2 days ago)
+
+This memory is 2 days old. Memories are point-in-time observations...
+(全文内容...)
+---
+```
+新鲜度由 `MemoryAge` 算（超 1 天的加"可能过时，请核对现网代码"警告，`MemoryAge.java:40`）。
+
+### ⑦ 注入对话（3 秒等待）
+`collectPrefetchedRecall`（`MewCodeModel.java:1568`）等 Future 最多 3 秒，拿到非空 reminder 就：
+```java
+conv.addSystemReminder(reminder);
+```
+以 **system-reminder** 形式塞进当前对话，Agent 开启一轮时就带着这些记忆。超时就丢弃，绝不让召回拖住主请求。
+
+## 召回流程图
+
+```
+用户提问
+  │
+  ▼
+scan 用户目录 + 项目目录 → 200 条 MemoryHeader（新的在前）
+  │  过滤 alreadySurfaced（已展示过的不再给）
+  ▼
+向量粗筛 → top-20（Lucene 或 EmbeddingService，失败则全量）
+  │
+  ▼
+manifest 元数据清单（filename/description/时间）
+  │
+  ▼
+LLM selector 挑 ≤5 条 → 严格 JSON
+  │
+  ▼
+映射回 filePath+mtime → 读 5 条全文
+  │
+  ▼
+renderReminder 渲染（带新鲜度警告）
+  │  （3 秒内拿到才注入，超时丢弃）
+  ▼
+conv.addSystemReminder ← 注入本次对话轮次
+```
+
+## 设计要点小结
+- **三级漏斗**：200 全量 → 20 向量粗筛 → 5 selector 精筛 → 只对 5 条读全文，token 与精度平衡。
+- **全程 best-effort**：任何一步失败（向量算出错、selector 超时、JSON 解析失败）都返回空/降级，不阻塞用户。
+- **双层防刷屏**：`alreadySurfaced` 过滤 + 只挑"确定有用"的约束。
+- **隔离性**：selector 用独立 client/system prompt，避免污染主对话上下文。
+- **新鲜度提示**：旧记忆加"点快照、非实时"警告，防止把过时断言当事实。
