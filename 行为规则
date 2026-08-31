@@ -1,0 +1,175 @@
+基于最终（重构后）的代码，完整、仔细地介绍**行为规则模块**（`com.mewcode.learn`）。它的目标是：让 Agent 从**自己历史的工具调用行为**中自动提炼出"在什么情境下该用哪个工具"的规则，持久化并作为系统提醒回注给模型，从而在后续任务里自动复用——一个"观察→学习→注入"的自学习闭环。
+
+---
+
+## 一、模块组成（类清单）
+
+| 类 | 职责 |
+|---|---|
+| `Observation` | 一次工具调用的不可变记录 |
+| `ToolObserver` | 采集回调接口 `observed(Observation)` |
+| `ObservationStore` | 观察落盘（JSONL）+ 归档/剪枝 |
+| `Instinct` | 一条学到的规则（record） |
+| `InstinctEngine` | **核心**：两条学习通道 + 置信度 + 增强/去重/剪枝 |
+| `InstinctRepository` | 规则持久化 + Markdown 渲染 |
+| `InstinctInjector` | 把规则注入系统提醒 |
+| `KeywordExtractor` | 提取关键词（供 Jaccard 用） |
+| `JaccardDedup` | 语义相似度 + union-find 聚类 |
+| `AiInstinctExtractor` | 用 LLM 从摘要提炼候选行为 |
+
+---
+
+## 二、数据模型
+
+### `Observation`（一次工具调用）
+```java
+record Observation(
+    String sessionId, String turnId, int order,   // 归属回合 + 回合内序号
+    String toolName, Map<String,Object> toolArgs, // 工具名 + 参数
+    boolean success, long latencyMs, long ts)     // 结果、耗时、时间戳
+```
+
+### `Instinct`（学到的规则）
+看起来有：`id`、`domain`(workflow/testing/git/filesystem)、`trigger`(条件)、`action`(行为)、`evidence`(证据集合)、`confidence`(0~0.95)、`lastSeenMs`、`scope`。
+
+---
+
+## 三、采 集（入口）
+
+`StreamingExecutor.executeSingle` 每次工具执行完调用（`StreamingExecutor.java:215-221`）：
+```java
+observer.observed(new Observation(sessionId, currentTurnId,
+        sequence.getAndIncrement(), call.toolName(), call.args(),
+        !result.isError(), (long)(elapsed*1000), System.currentTimeMillis()));
+```
+observer 就是 `ObservationStore`（初始化时 `agent.setToolObserver(observationStore)`，`MewCodeModel.java:575`）。它把每条观察 append 到 `.mewcode/observations/observations_YYYYMM.jsonl`，按 8000 行或 5MB 自动归档，旧月份可被 `prune` 移入 archive（`ObservationStore.java`）。
+
+---
+
+## 四、触 发
+
+每轮 Agent 结束（`LoopComplete` 后），`MewCodeModel.executeLearn()`（`MewCodeModel.java:1489-1495`）在虚拟线程异步提交两条通道：
+```java
+ex.submit(() -> instinctEngine.incrementalUpdate(observationStore, 2, now)); // 统计
+ex.submit(() -> instinctEngine.runSemanticBatch(observationStore, now));     // AI
+```
+另外 `/learn` 命令可手动强制，`/rule` 命令可手动写高置信度规则。
+
+---
+
+## 五、通道一：统计学习（`incrementalUpdate`）
+
+**纯代码、无 LLM、每轮全量幂等重算**。
+
+1. **全量读**观察 `loadWindow(0, MAX)`，`detectFrequentSequences` 按 `sessionId|turnId` 分组、按 `order` 排序，统计每个回合内**相邻工具对 "A->B"** 出现次数（`InstinctEngine.java:45-73`）。
+2. 出现 ≥ `minCount`(2) 的序列成为 `SeqHit`。
+3. **`mergeSequenceHit`** 以 `seq`（"A->B"字符串）为键合并进 `byId`——天然唯一，置信度用 `Math.max`（幂等），evidence 用 `contains` 去重（`:145-162`）。
+4. `confidence(count) = 0.5 + 0.15*(count-1)`，封顶 0.95。
+5. `pruneDeprecated`（30 天半衰期衰减 + 1 天宽限）后持久化。
+
+结果：像 `Bash->ReadFile`、`ReadFile->Bash` 这类高频序列沉淀为一条条"工具对本能"规则。
+
+---
+
+## 六、通道二：AI 语义学习（`runSemanticBatch`）
+
+**用 LLM 从观察摘要提炼"情境→行为"的高层规则**。
+
+### 1. 增量窗口（杜绝老数据重喂）
+```java
+List<Observation> increment = store.loadWindow(lastAiWatermark + 1, now); // 只取新增
+if (increment.size() < aiBatchThreshold) return;   // 攒够 N(50) 条才跑，省 LLM
+```
+`lastAiWatermark`（最大已处理 ts）推进，保证**每批只喂"自上次以来新增的观察"**，不会把老数据反复喂给 LLM 偷刷置信度。
+
+### 2. 摘要 + LLM 提炼
+`buildSummary(increment)` 把新增观察转成工具序列文本（截断 8000 字符），交给 `aiExtractor.extract(summary)`（即 `AiInstinctExtractor.using(client)`）→ 返回一批 `Candidate(trigger, action, domain)`。
+
+### 3. 模糊增强（`reinforceWithCandidates`）——核心
+每条候选 C：
+- **`findNearestAiRule`**：在已入库的 AI 规则里，按 **Jaccard 相似度**（`trigger+action+domain` 的关键词集合）找语义最近（≥ `AI_SIMILARITY_THRESHOLD=0.5`）且 evidence 含 `"ai"` 的规则。
+- **命中 → 强化**：已有规则 confidence `+0.15`（封顶 0.95）、合并 evidence、保留代表 trigger/action。
+- **未命中 → 新建**：以 `0.5`（低于注入线）入库，作为"首次见到的新行为"垫底。
+
+因为是**模糊匹配而非字面相等**，所以即使 LLM 措辞不稳定也能正确命中两次断言同一行为的候选 → 这是对"非确定性 LLM"的关键适配。
+
+### 4. 坍缩（`consolidateAiRules`）
+保存前对残留的近义 AI 规则再做一次同一套模糊聚类（`0.5`），坍缩成高置信度代表 + 合并 evidence；工具对规则原样放行。
+
+### 5. 剪枝 + 持久化
+`pruneDeprecated` → `persist`。
+
+**效果**：LLM 首次提出的"新行为"落在 0.5，只有后续批次（语义上）再次断言才爬向 0.65 并注入——解决了"AI 规则永远卡 0.5 无法注入"的缺陷。
+
+---
+
+## 七、置信度生命周期（两类共用的框架）
+
+```
+0.5 ──── 统计: 每多1次观察 +0.15 ──────────► 0.95(封顶)
+  │      AI:   每被语义重复断言一次 +0.15  ─► 0.95
+  │
+  ├─ 0.65 = INJECT_THRESHOLD：达到才渲染进 auto-evolved.md、才被注入
+  ├─ 0.55 = DEPRECATE_THRESHOLD：长期不强化则时间衰减（30天半衰期）到低于此值 → 淘汰
+  └─ 新规则有 1 天宽限期，防刚建就因初始 0.5 被误删
+```
+`decay(c, idleMs) = c * 0.5^(idleMs/HALF_LIFE_MS)`。
+
+---
+
+## 八、持久化与注入
+
+**`InstinctRepository`**：
+- 状态存 `.mewcode/rules/instincts.json`（原子写）。
+- `renderMarkdown(instincts, minConfidence)` 把 confidence ≥ 阈值的规则按 domain 渲染成 `auto-evolved.md`。
+
+**`InstinctInjector.buildRulesContent`**：读用户级 + 项目级的 `auto-evolved.md`（项目覆盖用户），拼成规则文本。
+
+**注入**：新会话首次（`instinctRulesInjected` 标志）作为 **system reminder** 塞进对话（`MewCodeModel.java:1243-1246`）→ 模型下一轮就能复用这些"本能"。
+
+---
+
+## 九、端到端流程
+
+```
+工具执行 ──→ ObservationStore(JSONL)
+              │
+   每轮 LoopComplete ──→ executeLearn()(异步)
+              │
+   ┌──────────┴───────────┐
+   ▼                      ▼
+ 统计通道                AI通道
+ incrementalUpdate      runSemanticBatch
+ (全量幂等)   ──┐        │(增量窗口+LLM)
+   │            │        │
+   └─ 工具对规则 ┘        └─ 模糊增强+坍缩
+              ▼
+   instincts.json + auto-evolved.md   （≥0.65 的规则）
+              ▼
+   InstinctInjector ──→ system reminder ──→ 下次会话复用
+```
+
+---
+
+## 十、具体走一遍例子
+
+**场景**：用户反复用"改文件 → 跑 npm test"修 bug。
+
+1. **采集**：三四回合里每次 `EditFile(...)` / `Bash("npm test")` 都被记成 Observation。
+2. **统计通道**：`EditFile->Bash` 出现 ≥2 次 → 生成规则 `{trigger:"EditFile->Bash", domain:"testing"(含npm), confidence: 按次数}`；次数到 3 → 0.8，直接进 `auto-evolved.md`。
+3. **AI 通道**：攒够 50 条新观察后，LLM 从摘要提炼候选 `{trigger:"after editing code", action:"run npm test", domain:"testing"}` → 首次出现 → 建 0.5；下一批 LLM 又（语义近似的）提一次 → 强化到 0.65+ → 注入。
+4. **注入**：下次新会话首轮，系统提醒带上"编辑代码后应跑 npm test" → 模型遇到改动时自动倾向跑测试，无需用户重复交代。
+
+---
+
+## 十一、当前实现要点（含我们做的修正）
+
+1. **两条通道彻底分离**：`runSemanticBatch` 不再嵌套 `incrementalUpdate`，各自的入口/持久化独立，结构清晰。
+2. **统计通道不做冗余 dedup**：工具对以 `seq` 为键天然唯一。
+3. **AI 通道真正增量**：只喂新增观察，杜绝老数据重喂偷刷置信度。
+4. **增强与去重统一为"模糊增强"一条线**：用 Jaccard 语义相似（非字面精确）驱动强化与坍缩，适配非确定性 LLM，修复"AI 规则永远卡 0.5 无法注入"的缺陷。
+5. **共享阈值** `AI_SIMILARITY_THRESHOLD=0.5` + 注入线 `0.65` + 衰减/淘汰框架，构成完整生命周期。
+
+---
+
+一句话总结：**行为规则模块 = 观察采集 → 双通道学习（统计学工具序列、AI 学语义规则）→ 置信度生命周期（模糊增强 + 衰减淘汰）→ 持久化渲染 → 系统提醒注入**，让 Agent 把自己"重复做过的事"沉淀为可复用的项目本能。相关测试（`InstinctEngineTest`、`SelfLearningScenarioTest`、`BehaviorRulesIntegrationTest`）均通过验证。
