@@ -1,0 +1,827 @@
+MewCode 项目架构与功能模块详解
+
+本文档面向外部读者 / AI / 新成员,目标是让读者在尽可能短的时间内准确理解 MewCode 这个项目的整体架构、核心流程、各功能模块的实现方式与关键代码位置。
+
+阅读建议:先看第 1、2 章建立全局认知,再看第 3 章掌握核心 Agent 循环,之后按需深入某一功能模块。
+
+---
+
+目录
+
+- 1. 项目概览
+- 2. 顶层架构与启动流程
+- 3. 核心:Agent 循环(agent 包)
+- 4. TUI 界面层(tui 包)
+- 5. LLM 客户端抽象(llm 包)
+- 6. 会话与消息模型(conversation 包)
+- 7. 工具框架(tool 包 + toolresult 包)
+- 8. 权限、Hook 与 MCP(permission / hook / mcp)
+- 9. 上下文压缩(compact 包 + session 包)
+- 10. 记忆与自我学习(memory 包 + learn 包)
+- 11. RAG 检索增强(rag 包)
+- 12. Skill / SubAgent / Teams 多智能体编排
+- 13. Worktree 与 Plan 模式(worktree / plan)
+- 14. 遥测与命令(telemetry / command)
+- 15. 配置系统(config 包)
+- 16. 数据存储与磁盘布局汇总
+- 17. 关键设计原则与全局概念清单
+
+---
+
+1. 项目概览
+
+MewCode 是一个从零实现的 AI Coding Agent(终端交互式编码智能体),可以直接理解需求、调用工具读写文件、执行命令、编辑代码,并在终端里以交互式聊天界面(TUI)运行。
+
+1.1 一句话概括
+
+    用户输入(终端聊天) → LLM(Claude/OpenAI/兼容协议) 流式推理
+      → 调用工具(读写文件/执行命令/搜索/RAG/子智能体/团队协作…) 
+      → 结果回填对话 → 循环直到任务完成
+
+1.2 核心特征
+
+  特征               	说明                                      
+  纯 Java / Java 21+	使用虚拟线程(Virtual Threads)实现高并发,主循环为阻塞队列 + 虚拟线程模式
+  Bubble Tea MVU   	终端 UI 采用 Go 的 Bubble Tea 模型的 Java 移植版 TUI4J,即 Model-Update-View 架构
+  多 LLM 协议         	通过单一 LlmClient 接口抽象 anthropic / openai / openai-compat 三种协议
+  MemAI 式记忆        	长期记忆 + 工具行为自学习(instincts)+ 向量索引(RAG)三层记忆体系
+  多智能体编排           	Skill(内联/分叉)、SubAgent(后台子智能体)、Teams(文件邮箱协作团队)
+  磁盘优先持久化          	会话、记忆、规则、遥测、向量索引全部落到 .mewcode/ 目录下的 JSONL/JSON/YAML 等文件
+  容错设计             	200K 上下文自动压缩(Layer1 工具结果预算 + Layer2 LLM 摘要)、会话恢复、文件回退(rewind)
+
+1.3 技术栈
+
+- 构建:Gradle(Kotlin DSL) + Shadow 插件打 fat-jar,入口 com.mewcode.MewCode
+- LLM SDK:anthropic-java 2.34、openai-java 4.37;openai-compat 用 java.net.http.HttpClient 直连 SSE
+- TUI:tui4j 0.3.3(Bubble Tea 移植)+ mordant 3.0.2(Markdown 渲染)
+- RAG:lucene-core 9.11(HNSW 向量检索)、pdfbox 3.0.3(PDF)、poi-ooxml 5.3.0(Word)
+- 配置/序列化:snakeyaml 2.2、jackson 2.21
+- MCP:io.modelcontextprotocol.sdk:mcp 1.1.3
+- 测试:JUnit 5
+
+1.4 顶层目录结构
+
+    src/main/java/com/mewcode/
+    ├── MewCode.java          # 程序入口(main)
+    ├── agent/                # ★ Agent 核心循环 + StreamingExecutor
+    ├── command/              # 斜杠命令框架(LOCAL / LOCAL_UI / PROMPT)
+    ├── compact/              # ★ 上下文压缩(Layer1 工具结果 + Layer2 LLM 摘要)
+    ├── config/               # 配置加载与模型(AppConfig/ProviderConfig/...)
+    ├── conversation/         # ★ 对话/消息模型(Message/ToolUse/ToolResult)
+    ├── filehistory/          # 文件版本备份,支持 rewind 回退
+    ├── history/              # 会话历史存储(JSONL 转写)
+    ├── hook/                 # 生命周期 Hook(工具前后/回合前后执行外部命令)
+    ├── learn/                # ★ 行为自学习(instincts/observations)
+    ├── llm/                  # ★ LLM 客户端抽象(Anthropic/OpenAI/OpenAiCompat)
+    ├── mcp/                  # MCP Server 集成
+    ├── memory/               # ★ 长期记忆(提取/召回/索引)
+    ├── permission/           # 权限引擎(模式 + 每工具决策)
+    ├── plan/                 # 计划模式(PlanFile)
+    ├── prompt/               # 系统提示词构建(PlanModePrompt/PromptBuilder)
+    ├── rag/                  # ★ RAG 检索增强(chunk/document/embedding/store/tool)
+    ├── session/              # 会话持久化/Snapshot/恢复/回收
+    ├── skill/                # Skill 技能系统
+    ├── subagent/             # ★ 子智能体(Agent 工具/ToolFilter/TaskManager)
+    ├── task/                 # 任务清单工具
+    ├── teams/                # ★ 多智能体团队(文件邮箱/后台/调度)
+    ├── telemetry/            # 遥测(LLM/工具/文件改动/文件监听)
+    ├── tool/                 # ★ 工具框架(Tool 接口/ToolRegistry/ToolCategory)
+    ├── toolresult/           # ★ 工具结果预算("Layer 1" 替换与溢出)
+    ├── tui/                  # ★ 终端 UI(TUI4J Model + 渲染 + 对话框)
+    └── worktree/             # git worktree 隔离
+
+标注 ★ 的包是理解系统的关键。
+
+---
+
+2. 顶层架构与启动流程
+
+2.1 启动入口 MewCode.main
+
+文件:src/main/java/com/mewcode/MewCode.java
+
+1. 解析配置路径:命令行参数 > 环境变量 MEWCODE_CONFIG > 默认。
+2. ConfigLoader.load(configPath) 加载配置,失败则退出。
+3. 构造 MewCodeModel(Bubble Tea 的 Model),传入 providers / mcpServers / hooks。
+4. new Program(model) 创建 TUI4J 程序,model.setProgram(program) 让后台线程能向 UI 注入消息。
+5. 启动一个虚拟线程延迟 500ms 后重注册 SIGINT 处理器(覆盖框架默认的退出行为,交给模型做优雅取消)。
+6. program.run() 进入 Bubble Tea 事件循环(init/update/view),结束后恢复光标。
+
+    var model = new MewCodeModel(config.getProviders(),
+            config.getMcpServers() != null ? config.getMcpServers() : List.of(),
+            config.getHooks() != null ? config.getHooks() : List.of());
+    var program = new Program(model);
+    model.setProgram(program);
+    Thread.ofVirtual().start(() -> { /* SIGINT 重注册 */ });
+    program.run();
+
+2.2 全局视角:一个消息从输入到完成的旅程
+
+    用户敲 Enter
+       │
+       ▼
+    MewCodeModel.update(KeyPressMessage)      # TUI 捕获按键
+       │  sendUserMessage()
+       ▼
+    conversation.addUserMessage(...)          # 加入本地会话
+       │  agent.run(conversation)
+       ▼
+    Agent.agentLoop(...)                      # ★ 核心循环(虚拟线程)
+       │  每轮迭代:
+       │    1. ContextCompactor.manage()       # 上下文压缩(超阈值时)
+       │    2. 注入 plan-mode / deferred-tools 系统提醒
+       │    3. ToolResultBudget.apply()        # Layer1 工具结果预算(精简超大结果)
+       │    4. client.stream(apiConv, tools)   # 流式调用 LLM
+       │    5. 消费 StreamEvent → 收集文本/思考/tool_use
+       │    6. 无工具调用 → 结束回合(LoopComplete)
+       │    7. 有工具调用 → StreamingExecutor.executeAll()
+       │         └─ 权限校验 → Hook → 执行 → 观察器/遥测
+       │    8. 结果回填 conversation(addToolResultsMessage)
+       ▼
+    MewCodeModel.handleAgentEvents()           # AgentEvent 队列 → UI 渲染
+
+关键约定:两套事件流
+
+- llm.StreamEvent(线级事件,由 LLM 客户端产生,Agent 消费)
+- agent.AgentEvent(Agent 循环级事件,由 Agent/StreamingExecutor 产生,UI 消费)
+- 两者通过有界 BlockingQueue(容量 64)解耦,Agent 跑在虚拟线程上,UI 主线程不被网络阻塞。
+
+---
+
+3. 核心:Agent 循环(agent 包)
+
+文件:
+
+- src/main/java/com/mewcode/agent/Agent.java —— 核心循环
+- src/main/java/com/mewcode/agent/AgentEvent.java —— 事件密封接口
+- src/main/java/com/mewcode/agent/StreamingExecutor.java —— 工具并发执行器
+
+3.1 职责
+
+Agent 是系统的"大脑",它:
+
+- 实现 SkillHost 接口(被 Skill 技能内联执行)。
+- 运行 agentLoop(一个无限 for 循环,maxIterations 限制),每次迭代 = 一轮"调用 LLM + 执行工具"。
+- 通过 run(conv) 返回一个 BlockingQueue<AgentEvent>,供 UI 异步消费。
+
+3.2 Agent 循环的每一轮(Agent.agentLoop,Agent.java:212)
+
+单轮迭代的关键步骤(顺序很重要):
+
+1. 检查迭代上限 / 中断标志。
+2. 注入后台任务通知:若设置了 notificationFn,把后台子智能体/队友的通知作为 <system-reminder> 注入。
+3. 计算工具 schema:registry.getAllSchemas(protocol),并按 toolNameFilter(如激活的 skill 白名单)过滤。
+4. 自动压缩检查:ContextCompactor.manage(...) —— Layer1(工具结果预算)总是执行,Layer2(LLM 摘要)在超阈值时执行;压缩导致会话变小则丢弃 usage anchor。
+5. 注入 deferred 工具提示:把"按需加载"的工具名列成系统提醒。
+6. (Plan 模式)注入 PlanModePrompt.buildReminder(...) 结构化流程提醒。
+7. Layer1 工具结果预算:ToolResultBudget.apply(conv, sessionDir, replacementState) 生成不可变的 apiConv,新记录持久化。
+8. 流式调用 LLM:client.stream(apiConv, tools),然后循环 poll(30s) 消费 StreamEvent:
+   - TextDelta → 追加文本、发 StreamText 事件
+   - ThinkingDelta/Complete → 思考块
+   - ToolCallStart/Complete → 收集工具调用
+   - StreamEnd → 记录 usage(输入/输出/缓存 token)、stopReason
+   - Error → 标记错误
+9. 遥测:发出 LlmRequestEvent(含 latency/cache 统计)与 AgentErrorEvent。
+10. 错误恢复:
+    - context/too long/prompt → ContextCompactor.forceCompact(最多 3 次重试)
+    - rate limit → 等待 5s 重试
+    - max_tokens → 第一次升级 maxOutput 到天花板 64K,之后有界的继续恢复
+11. 保存助手消息:conv.addAssistantFull(text, thinking, toolUses)。
+12. 重新锚定压缩估计:usageAnchor = new UsageAnchor(baseline=input+cacheRead+cacheCreation+output, conv.size())。
+13. 无工具调用 → 结束:做 git 快照 + FileHistory.makeSnapshot,发 LoopComplete 并 break。
+14. 有工具调用 → 执行:构建 StreamingExecutor,executeAll(toolCalls),结果 conv.addToolResultsMessage(...)。
+15. 若调用过 ExitPlanMode → 结束。
+
+    for (int iteration = 1; ; iteration++) {
+        // 1) 最大迭代检查
+        // 4) 自动压缩
+        String compactMsg = ContextCompactor.manage(conv, client, contextWindow, maxOutput,
+                wd, sessionId, compactTracking, recoveryState, iterToolSchemas, usageAnchor);
+        // 7) Layer1 工具结果预算
+        ApplyResult applied = ToolResultBudget.apply(conv, sessionDir, replacementState);
+        // 8) 流式调用 LLM
+        var streamQueue = client.stream(applied.apiConv(), tools);
+        // ... 消费 StreamEvent,收集 text/thinking/toolCalls ...
+        // 11) 保存助手消息
+        conv.addAssistantFull(text.toString(), thinkingBlocks, toolUseBlocks);
+        // 13) 无工具 → 完成
+        if (toolCalls.isEmpty()) { /* checkpoint + FileHistory */ putSafe(LoopComplete); break; }
+        // 14) 执行工具
+        var results = executor.executeAll(callInfos);
+        conv.addToolResultsMessage(resultBlocks);
+    }
+
+3.3 工具执行器 StreamingExecutor
+
+文件:src/main/java/com/mewcode/agent/StreamingExecutor.java
+
+职责:把一轮中的工具调用并发执行。分区策略:
+
+- READ 类工具(读文件/Glob/Grep/QueryRAG…)多个时用 ExecutorService.newVirtualThreadPerTaskExecutor() 并行执行;
+- WRITE / COMMAND 类工具顺序执行(避免文件写冲突)。
+
+单工具执行管线(executeSingle,StreamingExecutor.java:145):
+
+    1. registry.get(toolName) → 未知工具则报错
+    2. skill 白名单硬校验(toolFilter 拒绝 + 提示)
+    3. pre-tool hooks(可拒绝执行)
+    4. permission checker.check(tool, args)
+         ├─ DENY    → 报"Permission denied"
+         ├─ ASK     → 发 PermissionRequestEvent,阻塞等用户答复(超时 5min)
+         │            ALLOW_ALWAYS → checker.addAllowAlwaysRule(持久化)
+         └─ ALLOW   → 继续
+    5. tool.execute(args)  → ToolResult (捕获异常)
+    6. observer.observed(Observation)   # 喂给 learn 自学习
+    7. snapshotForRecovery(ReadFile 内容留存供压缩后恢复)
+    8. 输出截断(超过 ToolRegistry.MAX_OUTPUT_CHARS)
+    9. 发 ToolResultEvent → 遥测 ToolCallEvent
+    10. post-tool hooks
+
+    if (checker != null) {
+        var check = checker.check(tool, call.args());
+        switch (check.decision()) {
+            case DENY -> { /* reject */ }
+            case ASK -> {
+                var future = new CompletableFuture<PermissionResponse>();
+                putSafe(new AgentEvent.PermissionRequestEvent(call.toolName(), desc, future));
+                // 阻塞等 UI 通过 TUI 对话框答复(5 分钟超时)
+            }
+            case ALLOW -> {}
+        }
+    }
+    result = tool.execute(call.args());
+    if (observer != null)
+        observer.observed(new Observation(sessionId, currentTurnId, sequence.getAndIncrement(),
+                call.toolName(), call.args(), !result.isError(), (long)(elapsed*1000), now));
+
+3.4 AgentEvent(事件密封接口)
+
+AgentEvent.java 定义 UI 消化的事件类型:文本流、思考、工具使用/结果、LoopComplete/TurnComplete、PermissionRequestEvent、AskUserRequestEvent、UsageEvent、CompactEvent、RetryEvent、ErrorEvent 等。事件通过有界队列递给 TUI。
+
+---
+
+4. TUI 界面层(tui 包)
+
+文件目录:src/main/java/com/mewcode/tui/
+
+- MewCodeModel.java(2489 行,是装配中枢 + Bubble Tea Model)
+- AppState.java(页面状态:PROVIDER_SELECT / CHAT / RESUME)
+- ChatMessage.java(展示层消息模型,含 ToolBlockInfo)
+- MarkdownRenderer.java(手写 ANSI 渲染器,非库)
+- Styles.java(lipgloss 调色板)
+- SpinnerVerbs.java(旋转动词)
+- dialog/AskUserDialog.java、dialog/PlanApprovalDialog.java(纯字符串渲染对话框)
+
+4.1 Bubble Tea MVU 架构
+
+TUI4J 实现了 Go Bubble Tea 的 init() / update(Message) / view() 模型。MewCodeModel 实现 Model 接口:
+
+- init() → Command.checkWindowSize()
+- update(Message) → 处理窗口尺寸、按键、以及自定义消息:
+  - AgentEventMessage —— 当 agent 队列需要排水时触发
+  - MailboxPollMessage —— 团队/任务的邮箱轮询
+- view() → 依据 AppState 渲染 viewProviderSelect() / viewChat() / viewResume()
+
+后台线程通过 program.send(message) 向 Bubble Tea 循环注入消息——这是 Agent 事件到达 UI 的通道。
+
+4.2 按键处理(handleChatKey)
+
+- shift+tab → 循环切换权限模式(DEFAULT→ACCEPT_EDITS→PLAN→BYPASS)
+- ctrl+o → 折叠/展开工具块
+- escape(流式时) → 把 agent 转到后台
+- enter → 发送消息或斜杠命令;/ 打开斜杠菜单;@ 打开文件自动补全
+- 流式 spinner + SpinnerVerbs 随机动词
+
+4.3 Agent 事件 → UI 渲染(handleAgentEvents)
+
+按 AgentEvent 子类型映射到聊天消息:
+
+- StreamText → 追加到 streamBuf 流式缓冲
+- ToolUseEvent → 新建 ToolBlockInfo(loading=true)
+- ToolResultEvent → 填充该工具块的输出/耗时
+- LoopComplete → 若缓冲非空则落盘为 assistant 消息 + SessionManager.saveMessage,commitToolBlocks() 归档工具块(tool_collapsed / sub_agent / tool_visible)
+- PermissionRequestEvent → 打开 permDialog
+
+4.4 对话框
+
+AskUserDialog 与 PlanApprovalDialog 都是纯字符串渲染 + 按键处理器,由 MewCodeModel 每帧驱动,不依赖 TUI4J 组件:
+
+- AskUserDialog:多问题问卷(单选/多选/自由填充 Other + 导航栏 + 提交审阅页)。最终 handleKey 返回 Map<question, answer>(或 _declined)。
+- PlanApprovalDialog:计划完成后弹出,三选项:
+  - YOLO → 进入 PermissionMode.BYPASS(全自动批准)
+  - MANUAL → 恢复 plan 之前的模式
+  - FEEDBACK → 让用户输入修改意见,回填为新用户消息
+
+4.5 initializeProvider():系统装配中枢
+
+MewCodeModel.initializeProvider() 是一切功能的接线处:
+
+1. 创建 MemoryManager、构建系统提示词;
+2. client = LlmClient.create(selectedProvider, systemPrompt)(按 protocol 选择具体客户端);
+3. registry = ToolRegistry.createDefault()(读/写/编辑/bash/glob/grep),再注册 ExitPlanMode、AskUser、Agent(子智能体)、ToolSearch、worktree、task、team、RAG 工具(RAG 仅在 API key 存在时注册,后端为 LuceneVectorStore + LocalEmbeddingService);
+4. 创建 PermissionChecker、SessionManager(生成 session id)、TelemetryEmitter、FileHistory、FileStateCache;
+5. 构造并配置 Agent(instructions、memory content、permission、workdir、sessionId、tool observer、notification fn、hook engine);
+6. 异步连接 MCP Server(McpManager.connectAll() 虚拟线程),把发现的工具注册为 mcp__<server>__<tool> 并构建 MCP 指令;
+7. 触发 SESSION_START hook。
+
+---
+
+5. LLM 客户端抽象(llm 包)
+
+文件目录:src/main/java/com/mewcode/llm/
+
+5.1 统一接口 LlmClient
+
+    public interface LlmClient {
+        BlockingQueue<StreamEvent> stream(ConversationManager conv, List<Map<String,Object>> tools);
+        default void setMaxOutputTokens(int tokens) {}
+        static LlmClient create(ProviderConfig cfg, String systemPrompt) {
+            return switch (cfg.getProtocol()) {
+                case "anthropic"     -> new AnthropicClient(cfg, systemPrompt);
+                case "openai"        -> new OpenAiClient(cfg, systemPrompt);
+                case "openai-compat" -> new OpenAiCompatClient(cfg, systemPrompt);
+                default -> throw new IllegalArgumentException(...);
+            };
+        }
+    }
+
+统一抽象:所有实现都启动一个虚拟线程,把 StreamEvent 写进有界队列(容量 64),Agent 负责消费。这把网络 I/O 线程与 UI 线程彻底解耦。
+
+5.2 StreamEvent(线级事件,密封接口)
+
+TextDelta / ThinkingDelta / ThinkingComplete / ToolCallStart / ToolCallDelta / ToolCallComplete / StreamEnd(stopReason, input, output, cacheRead, cacheCreation) / Error。
+
+5.3 三种实现
+
+  客户端               	协议                   	说明                                      
+  AnthropicClient   	Anthropic Messages   	用官方 SDK 流式,支持 extended thinking、prompt caching(对 system 块、最后一个工具 schema、最后一个用户尾块加 cache_control 锚点,保证跨轮 prompt 前缀字节稳定命中缓存)
+  OpenAiClient      	OpenAI Responses API 	官方 SDK,thinking 用 Reasoning.effort(HIGH)
+  OpenAiCompatClient	/chat/completions SSE	直连 HTTP(vLLM/Ollama/Together/Groq),手写 SSE 解析,工具参数按 index 累积
+
+5.4 关键点
+
+- ModelResolver:解析 haiku/sonnet/opus 别名到具体 Claude 模型;supportsAdaptiveThinking 判断是否用自适应预算。
+- LlmException 层级:AuthenticationException / RateLimitException / ContextTooLongException / NetworkException,客户端各自 classifyError() 归类。
+- 每个客户端用自己的 buildMessages/buildInput/buildChatMessages 把统一的 Message 模型翻译成原生形状;mergeConsecutiveSameRole() 合并相邻同角色消息以满足 API 交替角色要求。
+- Anthropic 客户端会尽力 fetchModelContextWindow()(5s 超时)回填真实上下文窗口。
+
+---
+
+6. 会话与消息模型(conversation 包)
+
+文件目录:src/main/java/com/mewcode/conversation/
+
+- Message(role + content + 可选 thinkingBlocks/toolUses/toolResults)
+- ThinkingBlock(thinking, signature)
+- ToolUseBlock(toolUseId, toolName, arguments)
+- ToolResultBlock(toolUseId, content, isError)
+- ConversationManager(消息容器的核心)
+
+6.1 ConversationManager
+
+持有一个 List<Message> history(可变)+ LTM 注入/激活技能标志。关键 API:
+
+  方法                                      	作用                                      
+  addUserMessage/addAssistantMessage      	追加简单文本消息                                
+  addAssistantFull(text, thinking, toolUses)	助手消息(思考 + 工具调用)                         
+  addToolResultsMessage(List<ToolResultBlock>)	以 user 角色承载工具结果,保证协议配对                  
+  addSystemReminder(content)              	以 user 角色包装 <system-reminder> 注入        
+  injectLongTermMemory(instructions, memories)	在 index 0 一次性注入 LTM(# mewcodeMd/# autoMemory/# currentDate)
+  repairDanglingToolUses()                	中断后为"悬空"的 tool_use 补齐占位错误结果,避免协议错位      
+  truncateTo(index)                       	rewound 截断                              
+  setActiveSkill/getActiveSkillContext()  	激活技能上下文注入                               
+
+    public void addSystemReminder(String content) {
+        history.add(new Message("user", "<system-reminder>\n" + content + "\n</system-reminder>"));
+    }
+
+核心设计:系统提醒/记忆/技能上下文全部以 user 角色的 <system-reminder> 块注入,既满足多数 API 的角色交替要求,又避免占用真正的 system prompt。
+
+中断容错:repairDanglingToolUses()(ConversationManager.java:60)在 Ctrl+C 取消 agent 后,为所有没有对应结果的 tool_use id 追加占位错误结果,保证 LLM 永远不会收到孤立的 tool_use——这是对协议保真度的显式关注。
+
+---
+
+7. 工具框架(tool 包 + toolresult 包)
+
+7.1 工具抽象(tool 包)
+
+文件目录:src/main/java/com/mewcode/tool/
+
+    public interface Tool {
+        String name();
+        String description();
+        ToolCategory category();               // READ / WRITE / COMMAND
+        Map<String,Object> schema();           // 协议无关的 JSON schema
+        ToolResult execute(Map<String,Object> args);
+        default boolean shouldDefer() { return false; }   // 按需加载(延迟)工具
+    }
+
+- ToolCategory:READ(可并行)/ WRITE / COMMAND
+- ToolResult:(output, isError) 值对象,success()/error() 工厂
+- ToolRegistry(线程安全 ConcurrentHashMap<String,Tool>):
+  - getAllSchemas(protocol) —— 跳过未发现的 deferred 工具;对 openai 协议重包成 {type:"function", name, description, parameters}
+  - getDeferredToolNames() / markDiscovered(name) / searchDeferred —— 支撑"按需加载工具"
+  - createDefault() —— 注册基础工具(ReadFile/WriteFile/EditFile/Bash/Glob/Grep)
+  - MAX_OUTPUT_CHARS = 10_000 输出截断
+- FileStateCache:读前必须编辑(read-before-edit)校验。record(读取内容+mtime)、validate(absPath)(文件从未读或 mtime 变化则拒绝),由 Read/Write/Edit 工具注入。
+
+7.2 内置工具实现(tool/impl)
+
+  工具                    	类别               	关键实现                                    
+  ReadFileTool          	READ             	支持 offset/limit(默认 2000),1-based 行号 + \t;记录 FileStateCache
+  WriteFileTool         	WRITE            	建父目录、追踪 created、read-before-write 校验、遥测 diff
+  EditFileTool          	WRITE            	old_string 必须恰好出现一次,否则失败;更新缓存 + 遥测      
+  BashTool              	COMMAND          	并发读 stdout/stderr 防管道死锁;超时(默认 120s,max 600s)强杀;优先 Git Bash,否则 cmd /C
+  GlobTool              	READ             	Files.walkFileTree + glob matcher,跳过 .git/node_modules 等
+  GrepTool              	READ             	跳过二进制文件(首 512 字节含 null 字节),输出 rel:line:content
+  AskUserTool           	READ(deferred)   	弹问卷对话框,阻塞等答复(5 分钟)                      
+  ExitPlanModeTool      	READ(deferred)   	仅在 plan 模式且 plan 文件存在时成功                
+  Enter/ExitWorktreeTool	COMMAND(deferred)	见第 13 章                                 
+  ToolSearchTool        	READ(非 deferred) 	发现 deferred 工具/子智能体(select: / 关键词 / subagent:)
+
+Deferred 机制:shouldDefer()=true 的工具 schema 默认不发给 LLM;只有通过 ToolSearchTool 查询并按需标记 discovered 后才会出现。MCP 工具、AskUser、Worktree、ExitPlanMode 都是 deferred;ToolSearch 常驻可见以便发现它们。
+
+7.3 工具结果预算 "Layer 1"(toolresult 包)
+
+文件目录:src/main/java/com/mewcode/toolresult/
+
+目的:控制上下文成本——把超大工具结果替换成小型预览标签,把完整内容溢出到磁盘。状态按 tool_use_id 冻结,保证 Anthropic 的 prompt cache 看到字节稳定的前缀。
+
+ToolResultBudget.apply(conv, sessionDir, state) —— "Design B",绝不修改输入会话,而是重建一个新的 ConversationManager:
+
+1. 决策:对每个结果查 ContentReplacementState(已替换→复用冻结预览;已见未替换→保留原文;已打标签→冻结标签本身;否则→新候选)。
+2. Pass 1:单个结果 > SINGLE_RESULT_LIMIT(50_000 字符)→ spillAndPreview,记录替换并冻结。
+3. Pass 2:单条消息聚合 > MESSAGE_AGGREGATE_LIMIT(200_000)→ 按长度降序溢出最大的。
+4. Pass 3:若总助手轮数 > 10,把 >2k 字符的旧结果剪成 "[Stale output snipped: N chars]",保留最近 10 轮。
+5. 返回 ApplyResult(apiConv, newRecords);新记录由 ReplacementRecordsIO 追加到 <sessionDir>/replacement_records.jsonl。
+
+安全性:safeSpillName(toolUseId) 把非 [A-Za-z0-9._-] 替换为 _ 并防御 ./..,防止模型提供的 id 逃逸溢出目录。
+
+    // Pass 1: 单个结果超限 → 溢出
+    if (tr.content().length() > SINGLE_RESULT_LIMIT) {
+        String preview = spillAndPreview(spillDir, tr);
+        decisions.put(tr.toolUseId(), preview);
+        state.replacements().put(tr.toolUseId(), preview);   // 冻结
+    }
+
+恢复:ContentReplacementLifecycle.reconstruct(messages, records, inherited) 在续会/分叉时重建状态——凡消息里可见的工具结果 id 全部视为已冻结,叠加磁盘记录,再从父级(分叉)补齐。
+
+---
+
+8. 权限、Hook 与 MCP(permission / hook / mcp)
+
+8.1 权限引擎(permission 包)
+
+文件:PermissionMode.java / PermissionChecker.java / PermissionResponse.java
+
+PermissionMode 四模式 + 每类工具决策:
+
+- DEFAULT:READ 通过、WRITE/COMMAND 询问
+- ACCEPT_EDITS:读+写通过、命令询问
+- PLAN:委托 DEFAULT(另有计划模式特例)
+- BYPASS:全部通过(YOLO)
+
+PermissionChecker.check(tool, args) 是 6 层决策管线:
+
+1. Layer 0(Plan 特例):PLAN 模式只允许 {Agent, ToolSearch, AskUserQuestion, ExitPlanMode},且 Write/Edit 仅当路径含 .mewcode/plans/。
+2. Layer 1(安全命令):Bash 若命中 SAFE_COMMANDS 且无危险元字符(| ; && > $()则自动通过。
+3. Layer 2(危险命令):正则命中 rm -rf /、mkfs、dd、fork-bomb、curl|sh 等 → 拒绝。
+4. Layer 3(路径沙箱):读写编辑路径必须在项目根或 /tmp 下。
+5. Layer 4(文件规则):合并三份 YAML(~/.mewcode/permissions.yaml 用户、项目、permissions.local.yaml 本地),last-match-wins。
+6. Layer 4b(allow-always 会话集合):由本地文件里的 ALLOW 规则种子化。
+7. Layer 5(模式矩阵):兜底 mode.decide(category)。
+
+"允许总是"(addAllowAlwaysRule)会以内容寻址、去重、原子写的方式追加到 permissions.local.yaml,重启后 seedAllowAlwaysFromLocal() 恢复。
+
+8.2 Hook 系统(hook 包)
+
+文件:HookEngine.java + config/HookConfig.java
+
+Claude-Code 风格的生命周期 Hook:在会话/回合/工具前后跑外部命令,并可拒绝工具执行。
+
+- EventName:session_start/end、turn_start/end、pre_send、post_receive、pre_tool_use、post_tool_use、shutdown
+- ActionType:COMMAND(bash -c)、SCRIPT、PROMPT
+- 条件支持字符串相等(tool==bash)、正则(event=~session.*)、args.<key> 变量解析
+- runPreToolHooks 中首个 reject=true 且条件满足的 hook 会以 PreToolResult(rejected, output) 中止工具调用
+
+8.3 MCP 集成(mcp 包)
+
+文件:McpManager.java
+
+把 MCP Server 的工具桥接为 MewCode 的 Tool:
+
+- 传输方式:command+args → stdio(StdioClientTransport);url → HTTP/SSE(HttpClientStreamableHttpTransport);Windows 上对 npx/npm/... 自动追加 .cmd。
+- 支持 env 中的 ${VAR} 展开。
+- 每个发现的工具包装为 McpToolWrapper,命名空间 mcp__<server>__<tool>,category=COMMAND 且 shouldDefer()=true(延迟加载)。
+- 在 MewCodeModel 初始化时,虚拟线程异步连接,把工具注册进共享 ToolRegistry,并构建 # MCP Server Instructions 提示块;/mcp 命令查看状态。
+
+---
+
+9. 上下文压缩(compact 包 + session 包)
+
+9.1 分层压缩策略(compact 包)
+
+文件目录:src/main/java/com/mewcode/compact/
+
+- ContextCompactor.java(核心,静态引擎 + UsageAnchor + 熔断状态)
+- RecoveryState.java(最近读取文件 + 激活技能快照)
+
+目标:把对话控制在上文窗口内,镜像 Claude Code 的 compact.ts / autoCompact.ts 设计。
+
+阈值计算(computeCompactThreshold):
+
+    threshold = (contextWindow - reserve) - margin
+      reserve = maxOutput(默认 20_000 预留,给摘要响应) 
+      margin  = 手动 3_000(硬触发) / 自动 13_000(软触发)
+
+manage 每次迭代执行:
+
+1. Layer 1(offloadAndSnip,无条件):单结果 >50K 溢出到 .mewcode/tool_results/;单消息聚合 >200K 渐进溢出;旧结果(>2K)剪成 [Stale output snipped]。
+2. 计算当前 token(currentTokens)。
+3. 低于软触发线 → 只做 Layer1。
+4. 达到硬触发线 → forceCompact(绕过熔断)。
+5. 熔断未触发 → autoCompact(成功则重置熔断);失败则记录熔断(连续失败后只做 Layer1)。
+
+Layer 2 —— LLM 摘要(autoCompact):
+
+1. 倒序累积 token 计算 keepStartIndex(保留最近 KEEP_RECENT_TOKENS=10K,最少 MIN_KEEP_MESSAGES=5,上限 40K),并做"配对保护"(若边界落在 user 的 tool_result,回退到其来源 assistant 的 tool_use)。
+2. 序列化前缀(截断工具结果)→ 流式调用 LLM 请求摘要 → 解析 <summary> 标签。
+3. 持久化 compact_boundary 记录 + 快速 live snapshot + git worktree 快照。
+4. 重建 = 一条摘要 user 消息 + 保留的逐字尾巴。
+5. 追加 buildRecoveryAttachment(...)(最近读的文件、激活技能、可用工具)后 replaceConversation。
+
+Usage anchor(真实用量锚定):
+
+    public record UsageAnchor(int baselineTokens, int anchorCount) {}
+    // currentTokens: 若 anchor 有效 ⇒ baseline(provider 上报的 input+cacheRead+cacheCreation+output) + 追加消息的字符估算
+    //                否则 ⇒ 纯字符全量估算
+
+冷启动用字符估算;每次流结束用 provider 上报的真实 usage 重锚定。baseline 覆盖已发送的上下文 + 刚追加的助手消息,之后新增的消息再增量估算。缓存命中时真实 input 很小,锚定比纯字符估算更准。
+
+9.2 RecoveryState
+
+线程安全快照集合:recordFileRead(path, content)(由 StreamingExecutor 在每次成功的 ReadFile 后从磁盘重读)、recordSkillInvocation(name, body)(由 Agent.recordSkillInvocation)。Layer2 摘要抹掉整段转写后,通过 buildRecoveryAttachment 把最近读的文件内容和激活技能 SOP 重新挂回,让模型不遗忘。
+
+9.3 会话持久化与恢复(session 包)
+
+文件:SessionManager.java / SessionSnapshot.java / SessionReaper.java
+
+- 会话转写:.mewcode/sessions/<id>.jsonl,格式 {"role","type?","content","ts"};type=="compact_boundary" 的记录存 CompactBoundary(summary, keep)。
+- meta 侧车:.mewcode/sessions/<id>.meta.json(首消息、消息数、大小、修改时间、git 分支,5min TTL),让 listSessions 免全量加载。
+- Live snapshot:.mewcode/sessions/<id>.state.json(LiveState(summary, keep, boundaryOffset))。快速恢复 = 读小快照 + 按字节偏移只读压缩后的尾巴;无快照则退化为全量扫描重建。
+- SessionSnapshot:git 自动化快照(git add -A + commit --allow-empty),commitCheckpoint / restoreCheckpoint 支撑 /rewind。
+- SessionReaper:守护线程(首次 60s,之后每 6h)按保留天数/最大数清理陈会话。
+
+---
+
+10. 记忆与自我学习(memory 包 + learn 包)
+
+10.1 长期记忆(memory 包)
+
+文件:MemoryManager(生命周期)/ MemoryScanner(扫描)/ MemoryRecall(召回)/ MemoryAge(时效)
+
+设计理念:刻意不用向量——检索靠"选择器 LLM"从清单里挑相关记忆名,而非 embedding。
+
+- 提取(MemoryManager.extract,每 5 轮触发,需 ≥4 条消息):用一次性提示让 LLM 把事实分类为 user(用户级)/ feedback(用户级)/ project(项目级)/ reference(项目级),解析 ### <type> 分段,丢弃幻影类型。
+- 双写持久化:列表 auto_memory.json + 每条记忆一个带 frontmatter 的 .md(含 type/name[稳定 slug]/description)。
+- 索引:MEMORY.md 由 MemoryScanner 从 .md 文件反编(最新优先),是"单一事实源"。
+- 召回(MemoryRecall.findRelevantMemories):扫描清单 → 排除已上浮的记忆 → 用选择器 LLM 挑 ≤5 个名字 → 读全文件内容 → 渲染为带新鲜度头的系统提醒。前置选择在虚拟线程里做(8s 超时),结果在下一轮前 3s 内 join 注入。
+- 注入:MewCodeModel 通过 Agent.setMemoryContent → ConversationManager.injectLongTermMemory 在每会话开头注入。
+- 指令:读取 <workDir>/MEWCODE.md 或 .mewcode/INSTRUCTIONS.md。
+
+10.2 行为自学习(learn 包)
+
+文件:ToolObserver(观察回调)/ ObservationStore(JSONL 存观察)/ InstinctEngine(核心算法)/ AiInstinctExtractor(LLM 提取)/ InstinctRepository(持久化 + 手动规则)/ JaccardDedup / KeywordExtractor / InstinctInjector(注入)
+
+思路:观察智能体每次工具调用,学到可复用的"行为规则(instinct)",靠两条路径互补:
+
+- Path A(统计,免 LLM):InstinctEngine.incrementalUpdate 按 sessionId|turnId 分组、按 order 排序,统计相邻工具对(A->B ≥ minCount 触发);置信度 confidence(n)=min(0.5+0.15*(n-1), 0.95),30 天半衰期指数衰减 decay = conf * 0.5^(idleMs/halfLife)。
+- Path B(语义,LLM):runSemanticBatch 用水印(只取 ts > lastAiWatermark 增量)且需 ≥50 条观察,把工具对序列摘要喂给 LLM,解析 Trigger:/Action: 规则;新规则经 Jaccard 相似度(≥0.5)模糊加权,要么强化已近似规则要么新建;consolidateAiRules 用联合-查找聚类去重;pruneDeprecated 衰减并淘汰低于阈值的规则(保留 1 天新生宽限期)。
+
+    INITIAL_CONFIDENCE=0.5; CONFIDENCE_STEP=0.15; CONFIDENCE_CAP=0.95;
+    DEPRECATE_THRESHOLD=0.55; INJECT_THRESHOLD=0.65; HALF_LIFE_MS=30天;
+
+- 持久化:观察 → .mewcode/observations/observations_<yyyyMM>.jsonl(按月,8K 行/5MB 轮转归档);规则 → .mewcode/rules/instincts.json(Jackson 漂亮 JSON)+ 注入用渲染版 auto-evolved.md。用户级规则在 ~/.mewcode/rules/。
+- 注入:每会话第一条用户消息时,InstinctInjector.buildRulesContent(...) 把 ≥0.65 置信度的规则作为系统提醒注入一次。
+- 手动命令:/learn(强制学习)、/rule <Trigger> :: <Action>(手动写规则)。
+
+10.3 与 Agent 的耦合方式(重要)
+
+Agent.java 不直接引用 memory/learn 类——它们都是"特征孤岛",由 MewCodeModel 装配:
+
+- Agent 只携带不透明字符串/回调:instructions / memoryContent / ToolObserver(给 StreamingExecutor)。
+- 学习/提取都跑在虚拟线程,best-effort 非阻塞,异常吞掉,绝不打断交互循环。
+
+---
+
+11. RAG 检索增强(rag 包)
+
+11.1 组件(全部插件化接口)
+
+文件目录:src/main/java/com/mewcode/rag/
+
+- RagConfig(单例配置:dbPath、embedding 参数、chunkLines=100、topK=5)
+- chunk/Chunker → SimpleChunker(按行数)/ HeadingChunker(Markdown H2/H3)/ OutlineChunker(中文数字编号分节,可选 4000 字符超长分块,去页脚噪声)
+- document/DocumentParser → CodeParser(.java/.go/.ts…等)、MarkdownParser(去 frontmatter)、PdfParser(PDFBox)、WordParser(POI)、TextParser
+- embedding/EmbeddingService → LocalEmbeddingService(默认,离线,基于哈希 2/3-gram 词袋 → 1024 维 + L2 归一化)/ LlmEmbeddingService(OpenAI 兼容远程,text-embedding-3-small,1536 维)
+- model/Chunk、model/Source
+- store/VectorStore → LuceneVectorStore(Lucene 9 HNSW 近似最近邻,KnnFloatVectorField + VectorSimilarityFunction.COSINE,索引里 source/chunk 双文档类型)
+- tool/IngestCodeTool、IngestDocsTool、QueryRagTool
+
+11.2 端到端流程
+
+入库(写路径):
+
+    文件 → DocumentParser → 纯文本 → Chunker → List<Chunk>(附 file/heading/lines 元数据)
+         → EmbeddingService.embedBatch → float[] → VectorStore.insertSource(Source)
+         → VectorStore.insertChunk(Chunk) → Lucene 文档(KnnFloatVectorField) → commit 落盘
+
+查询(读路径):
+
+    自然语言 query → QueryRagTool → embed(query) → VectorStore.search(queryEmbedding, topK)
+         → Lucene KnnFloatVectorQuery(HNSW) → top-K chunk → 格式化(Source/Section/Lines,≤2000 字符)
+
+选块策略:Markdown 用 HeadingChunker、PDF 用 OutlineChunker、其余 SimpleChunker。
+
+11.3 装配
+
+MewCodeModel.initializeProvider() 中,仅当 provider 有 API key 时才注册 3 个 RAG 工具,默认用 LocalEmbeddingService(离线)。索引目录 .mewcode/rag-index。
+
+---
+
+12. Skill / SubAgent / Teams 多智能体编排
+
+这三者构成"智能体编排栈":
+
+- skill —— 在主 Agent 上承载可运行的能力(SOP 提示注入)。
+- subagent —— 通过 Agent 工具派生一次性/后台隔离子 Agent。
+- teams —— 协调多个长驻 Agent(Leader + teammates),经文件邮箱异步通信。
+
+12.1 Skill 技能(skill 包)
+
+- SkillHost(由 Agent 实现)/ SkillForkHost(由 MewCodeModel 实现,扩展出子智能体能力)。用接口而非直接依赖 agent 包,避免循环依赖。
+- SkillCatalog.loadCatalog(workDir):三级合并(内置 → 用户全局 ~/.mewcode/skills/ → 项目 .mewcode/skills/),两阶段热重载。
+- 每个技能 = skill.yaml+prompt.md 或带 frontmatter 的 SKILL.md,含 allowed_tools、mode(inline/fork)、fork_context、model。
+- SkillExecutor:
+  - inline:校验 allowed_tools 已注册 → 替换 $ARGUMENTS → host.activateSkill(name, body) + recordSkillInvocation + setToolFilter(allowed::contains)(白名单,既隐藏 schema 又硬拦截执行)。
+  - fork:按 fork_context(none/recent/full) 构建种子会话 → host.runSubAgent(...)。
+- 技能以斜杠命令(/skillname)触发,不通过 LLM 工具调用。
+
+12.2 SubAgent 子智能体(subagent 包)
+
+- SubAgentSpec(不可变配置:name/description/tools/maxTurns/model)+ 3 个内置常量(GENERAL_PURPOSE/PLAN/EXPLORE)。
+- AgentTool(name()="Agent",COMMAND):execute 按参数路由:
+
+    execute(args)
+     ├─ team_name → runAsTeammate()         (交给 teams)
+     ├─ 无 subagent_type → runFork()        (分叉后台 agent,基于父会话历史)
+     └─ subagent_type:
+          background=true → runAsync()      (后台经 SubAgentTaskManager)
+          否则 → runSync()                  (当前线程阻塞执行)
+
+- ToolFilter.filterForAgent(source, spec, ...):返回一个新的受限 ToolRegistry,6 层过滤(MCP 恒通过 / 移除 ALWAYS_DISALLOWED / 自定义移除 / 异步白名单 / 每 spec 黑名单 / 每 spec 白名单)。
+- 同步路径:过滤注册表 → 用 selectClient 选 model → 新 Agent → 可选 git worktree 隔离 → 新会话 → run() 并消费 AgentEvent 直到 LoopComplete,返回最终文本。
+- 后台路径:SubAgentTaskManager.spawnSubAgent 起虚拟线程跑子 Agent,只观察 StreamText/Error/LoopComplete,产出 TaskNotification 由父 Agent 每轮 drain 成系统提醒。
+- 分叉路径:禁止嵌套分叉;复制父消息并把在途 tool_use 修补为占位结果,前置分叉样板,克隆父级 ContentReplacementState(共享稳定 prompt-cache 前缀)。
+
+12.3 Teams 多智能体团队(teams 包)
+
+- TeamManager(团队注册表 + Team/Member 内部类 + 后端探测)。
+- 三个后端:
+  - InProcessBackend(默认):队友在虚拟线程里跑 TeammateRunner,返回实时事件队列,最省资源。
+  - TmuxBackend:tmux new-window 起独立 mewcode --teammate CLI 进程(进程级隔离)。
+  - ITermBackend:macOS AppleScript 开 iTerm 标签页。
+- 通信核心 FileMailBox:JSON 文件的按收件人收件箱(<inboxes>/<agentId>.json),带陈旧锁重试的锁;消息种类 TASK(唤醒空闲工作线程)/ NOTICE(不唤醒)/ IDLE/ SHUTDOWN。
+- TeammateRunner.runInProcessTeammate 主循环:
+
+    while (!interrupted) {
+      injectPendingMessages()      // 未读收件箱 → 系统提醒
+      if (有任务prompt) conv.addUserMessage(prompt)
+      agent.run(conv)             // 跑一整轮,排水 AgentEvent → 记录进度
+      sendMessage(IDLE)           // 通知 leader 空闲
+      waitForNextPromptOrShutdown() // 500ms 轮询;仅 TASK 消息唤醒;SHUTDOWN 退出
+    }
+
+- SharedTaskStore:带 blocks/blockedBy 依赖的共享任务清单,leader 用它拆解工作、跟踪进度。
+- 协作工具 TeamTools:SendMessageTool(发给 lead/peer)、TeamCreateTool、TeamDeleteTool。队友专属的 SendMessageTool 绑定到该成员名,注册进其过滤注册表。
+- 通知到 leader:TeammateRunner.drainLeadMailbox 作为 Agent.setNotificationFn(...),每轮折成 <team-notification> 系统提醒;TUI 也用 MailboxPollMessage 周期性轮询。
+
+---
+
+13. Worktree 与 Plan 模式(worktree / plan)
+
+13.1 git Worktree 隔离(worktree 包)
+
+- 交互式持续工作树(EnterWorktree/ExitWorktree 工具 + WorktreeManager + WorktreeSessionStore):
+  - EnterWorktree → 校验 slug → WorktreeManager.create(git worktree add -B <branch> <dir>,大写 -B 重置孤立分支)→ PostCreationSetup.perform(复制 settings.local.json、配置 core.hooksPath、软链 node_modules、拷贝 .worktreeinclude 文件)→ 持久化 WorktreeSession(original_cwd/worktree_path/branch…)。
+  - ExitWorktree → 若 action=remove 且未 discard_changes,用 WorktreeChanges fail-closed 检查(有任何未提交/提交改动则拒绝删除),批准后删除。
+- 子智能体临时工作树(AgentWorktree 静态 API):AgentTool 为每个子智能体生成 agent-a<7hex> 这样的临时 slug,创建 .mewcode/worktrees/<branch>;完成后用 WorktreeChanges.hasChanges 决定保留或删除。
+- StaleCleanup:后台回收过期临时工作树(三层安全:临时模式匹配 → 时间 → fail-closed 脏检查),然后 git worktree prune。
+- 所有 git 子进程都设 GIT_TERMINAL_PROMPT=0 且清空 GIT_ASKPASS,防止交互式认证弹窗。
+
+13.2 Plan 模式(plan + prompt)
+
+- PlanFile:计划文件在 .mewcode/plans/,文件名是友好 slug(形容词-名词-MMdd-HHmm)。
+- PlanModePrompt.buildReminder(planPath, planExists, iteration):第 1 轮和每 5 轮注入完整提醒(5 阶段流程:explore → design → review → 写 plan 文件 → ExitPlanMode),其余轮注入稀疏提醒。
+- 强制在 PermissionChecker Plan 层:PLAN 模式只允许只读工具 + 写 .mewcode/plans/ 的 Write/Edit;完成后 ExitPlanModeTool 触发,MewCodeModel 弹 PlanApprovalDialog(YOLO / MANUAL / FEEDBACK)。
+- 模式流转:进入 plan 前保存 prePlanMode;批准后可切 BYPASS 或恢复原模式。
+
+---
+
+14. 遥测与命令(telemetry / command)
+
+14.1 遥测(telemetry 包)
+
+文件:TelemetryEvent(密封:LLM 请求/工具调用/文件改动/agent 错误/中断)/ TelemetryStore(按日 JSONL events_YYYYMMDD.jsonl)/ TelemetryEmitter(单例,有界队列 1024,虚拟线程写盘)/ FileWriteService(统一写层,算 diff,发 FileChangeEvent)/ FileStateRegistry(文件快照,区分 AGENT/USER 改动)/ FileWatcher(WatchService 监听外部 IDE 改动,500ms 去抖,按名字/路径过滤)。
+
+核心用途:/telemetry 命令统计 AI 生成代码占比。Agent 写入走 FileWriteService.write/edit(..., AGENT);外部改动由 FileWatcher 检出差分并归为 USER。FileWriteService.diff 用多重集 diff 统计增删行数。
+
+14.2 斜杠命令(command 包)
+
+- Command(name, description, aliases, type, hidden);CommandType: LOCAL(同步处理器→文本)、LOCAL_UI(纯 TUI 动作)、PROMPT(返回字符串发回 LLM)。
+- CommandContext:一堆 supplier(args/workDir/mode/toolCount/tokenCount/memoryList/memoryClear/sessionInfo/skillList/mcpInfo)。
+- CommandRegistry:构造器注册默认命令,register 同时映射别名,execute 按名/别名查找。
+- 默认命令:help、mcp、clear、compact、status、memory、plan、session、permission、resume、rewind、learn、rule、mem-ingest、skills、telemetry、review。
+- /review 是 PROMPT 类型,返回审查提示词作为下一条用户消息。
+
+---
+
+15. 配置系统(config 包)
+
+文件:ConfigLoader.java / AppConfig.java / ProviderConfig.java / McpServerConfig.java / HookConfig.java
+
+- ConfigLoader.load(path):SnakeYAML + Constructor(AppConfig) + SnakeCasePropertyUtils(snake_case→camelCase)。路径优先级:参数 > ~/.mewcode/config.yaml > ./.mewcode/config.yaml > ./.mewcode/config.local.yaml(合并)。
+- 合并规则:providers 全覆盖;MCP server 按 name 替换或追加;permissionMode 非空才覆盖;hooks 追加。
+- 校验:每个 provider 须有 name/protocol/base_url/model;protocol ∈ {anthropic, openai, openai-compat}。
+- ProviderConfig 关键解析:
+  - resolvedApiKey():配置值或环境变量(ANTHROPIC_API_KEY/OPENAI_API_KEY)。
+  - resolvedContextWindow():4 层回退(显式配置 > 自动 fetch > 内置 windowForModel 表 > 保守默认 200K/128K)。
+  - resolvedMaxOutputTokens():配置值或 thinking ? 64_000 : 8192。
+
+示例 config.yaml:
+
+    providers:
+      - name: glm
+        protocol: openai-compat        # anthropic / openai / openai-compat
+        base_url: "https://..."
+        api_key: "..."
+        model: glm-4.7
+        thinking: false
+        context_window: 128000
+    mcp_servers:
+      - name: context7
+        command: npx
+        args: ["-y", "@upstash/context7-mcp"]
+    hooks:
+      - id: beep
+        event: post_tool_use
+        type: command
+        command: "printf '\\a'"
+
+---
+
+16. 数据存储与磁盘布局汇总
+
+所有运行时数据都落在工作目录下的 .mewcode/(部分在用户主目录 ~/.mewcode/):
+
+  数据          	位置                                      	格式                                      
+  会话转写        	.mewcode/sessions/<id>.jsonl            	JSONL(role,type?,content,ts;含 compact_boundary)
+  会话 meta     	.mewcode/sessions/<id>.meta.json        	漂亮 JSON                                 
+  快速恢复快照      	.mewcode/sessions/<id>.state.json       	JSON LiveState                          
+  git 快照      	工作区 git                                 	git add -A + commit --allow-empty       
+  文件备份        	.mewcode/file-history/<id>/             	内容寻址 blob-<sha256> + snapshots.json     
+  工具结果溢出      	.mewcode/session/<id\|default>/tool_results/	每个 tool_use_id 一个文本文件                   
+  替换记录        	.mewcode/session/<id\|default>/replacement_records.jsonl	JSONL                                   
+  长期记忆        	.mewcode/memory/                        	auto_memory.json + 每记忆一个 frontmatter .md + MEMORY.md 索引
+  观察记录        	.mewcode/observations/observations_<yyyyMM>.jsonl	JSONL + archive/ 轮转                     
+  行为规则        	.mewcode/rules/instincts.json(用户规则在 ~/.mewcode/rules/)	漂亮 JSON + auto-evolved.md               
+  遥测          	.mewcode/telemetry/events_YYYYMMDD.jsonl	按日 JSONL                                
+  权限(用户/项目/本地)	~/.mewcode/permissions.yaml、.mewcode/permissions.yaml、.mewcode/permissions.local.yaml	YAML 规则列表(原子写)                          
+  RAG 索引      	.mewcode/rag-index/                     	Lucene 索引                               
+  Plan 文件     	.mewcode/plans/<slug>.md                	Markdown                                
+  工作树仓库       	.mewcode/worktrees/<branch>             	git 工作树                                 
+  团队邮箱        	.mewcode/teams/<name>/inboxes/<agentId>.json	JSON 消息列表                               
+
+几乎所有的持久化失败都被吞掉(best-effort 语义,镜像原 Go 实现)。
+
+---
+
+17. 关键设计原则与全局概念清单
+
+1. 单一 LlmClient 协议抽象:ProviderConfig.protocol 决定客户端;协议差异主要体现在(a)客户端类,(b)工具 schema 形状(getAllSchemas 对 openai 重包)。ModelResolver 别名仅 Anthropic 用。
+2. 两套事件流解耦:llm.StreamEvent(线级)→ agent.AgentEvent(循环级)→ UI。全程有界队列 + 虚拟线程,UI 永不阻塞网络。
+3. Bubble Tea 纯 MVU:一切(按键 + 后台事件)都是 Message,update() 单点分发,view() 每帧全量渲染。
+4. 两层上下文压缩:Layer1(本地工具结果预算/溢出,无 LLM)+ Layer2(LLM 摘要,保留逐字尾巴),配合 UsageAnchor 真实用量锚定与 RecoveryState 压缩后恢复。
+5. "特征孤岛"装配:memory/learn/RAG/teams 等高级功能由 MewCodeModel.initializeProvider() 装配,Agent 只携带不透明字符串/回调,保持解耦与可测试。
+6. 按需加载工具(Deferred):shouldDefer() + ToolSearchTool 让大量工具的 schema 不进上下文,控制 token 成本。
+7. 一切磁盘优先 + best-effort 容错:JSONL/JSON/YAML 持久化,异常多被吞掉以保交互不中断;会话可恢复、文件可回退、有实时遥测。
+8. 安全设计:read-before-edit(FileStateCache)、路径沙箱、危险命令检测、权限 6 层管线、git 禁交互认证、溢出文件名防逃逸。
+
+建议的代码阅读顺序
+
+1. MewCode.java → tui/MewCodeModel.initializeProvider()(装配全景)
+2. agent/Agent.agentLoop → agent/StreamingExecutor(核心循环与工具管线)
+3. llm/LlmClient 及三个实现(协议抽象)
+4. conversation/ConversationManager(消息模型)
+5. tool/ToolRegistry + tool/impl(内置工具)
+6. 按需:compact / memory+learn / rag / subagent+teams / worktree+plan
