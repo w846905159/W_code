@@ -1,0 +1,530 @@
+# 多智能体客服系统 — 架构与模块分析
+
+> 本文档面向**首次接触本项目的开发者/AI**，目标是让你快速、准确地理解：项目如何分层、每个功能怎么实现、一次对话的完整流程、关键代码在哪里。
+
+---
+
+## 1. 项目概述
+
+这是一个基于 **LangGraph** 编排的多智能体客服系统（以下简称"系统"）。用户提问后，系统由一个 **Supervisor（主管）智能体** 做意图路由与信息缺口判断，再把请求分发给对应的 **领域专家智能体**（产品/技术/账单/投诉/综合），专家结合 **RAG 向量检索** 得到的业务知识 + 上下文，由 **大模型（OpenAI 兼容 API，默认硅基流动）** 生成回复。
+
+三个显著特性：
+
+1. **双进程架构**：Flask Web 前台（5000 端口） 与 LangGraph API 服务（2024 端口）分离，Web 通过 HTTP/REST 调用 LangGraph。
+2. **Supervisor + 反问澄清**：信息不足时图节点用 `interrupt` 挂起，向用户追问，补充后 `resume` 继续跑完流程（防循环，`clarified_flag` 标记）。
+3. **真·流式输出（SSE）**：领域智能体把 LLM 增量 token 通过 LangGraph `custom` 事件推出，Web 端逐 token 渲染。
+
+---
+
+## 2. 技术栈
+
+| 类别 | 技术 | 用途 |
+|------|------|------|
+| 工作流编排 | `langgraph>=1.0` | StateGraph 状态机、节点/条件边、`interrupt` 中断 |
+| LLM 接入 | 自研 `OpenAICompatibleClient`（requests 直调） | 兼容任何 OpenAI 格式 API（代码里默认硅基流动） |
+| LLM SDK | `langgraph_sdk` | 进程间调用 LangGraph API Server |
+| 向量库 | `chromadb`（PersistentClient） | 业务数据落盘持久化 |
+| Embedding | `sentence-transformers` + 本地 `bge-large-zh-v1.5` | 中文语义向量；无模型时回退 TF-IDF |
+| 重排序 | 本地 Cross-Encoder 或 LLM 零样本重排 | 检索候选精排 |
+| 关键词检索 | `sklearn` TfidfVectorizer（char n-gram） | hybrid 策略的"关键词召回"侧 |
+| Web 前端 | Flask + 原生 JS（`marked` + `DOMPurify`） | 聊天界面、SSE 流式渲染 |
+| 配置 | `python-dotenv` + `.env` | 环境变量 |
+
+**依赖清单**：见 `requirements.txt`（langchain-core、langgraph、flask、pandas、Jinja 等，redis/mongo/pg 为可选未实际启用）。
+
+---
+
+## 3. 总体架构与目录结构
+
+```
+customer-service-ai-agent/
+├── app/                        # ① 应用层
+│   ├── graph.py                #    LangGraph 工作流（图结构、节点逻辑、状态）
+│   ├── service.py              #    LangGraph REST 调用、SSE 解析、会话/线程管理
+│   └── web.py                  #    Flask 路由入口
+├── agents/                     # ② 智能体层
+│   ├── base.py                 #    BaseAgent 抽象基类（提示增强 + 流式推送）
+│   ├── supervisor.py           #    主管智能体（意图路由 + 反问决策，LLM/规则双通道）
+│   ├── product.py              #    产品专家（RAG products）
+│   ├── tech.py                 #    技术支持专家（RAG tech_knowledge）
+│   ├── billing.py              #    账单专家（RAG billing_policies）
+│   ├── complaint.py            #    投诉处理专家（RAG complaint_records）
+│   └── general.py              #    综合客服（RAG service_info）
+├── retrieval/                  # ③ RAG 检索层
+│   ├── vector_store.py         #    ChromaDB 向量库 + 差异化检索策略
+│   ├── rerank.py               #    重排序（cross-encoder / LLM / 原序）
+│   └── document_loader.py      #    文档加载与切分（md/pdf/txt → chunk）
+├── core/                       # ④ 核心层
+│   ├── config.py               #    环境配置加载
+│   └── tools/query_classifier.py #  查询分类工具（历史遗留，路由现由 supervisor 负责）
+├── data/                       # ⑤ 数据层
+│   ├── *.json                  #    五大业务领域数据（产品/技术/政策/投诉/服务）
+│   └── chroma_db/              #    ChromaDB 持久化向量库
+├── scripts/                    # ⑥ 数据与建库脚本
+│   ├── build_db.py             #    重建/验证向量库
+│   ├── generate_data.py        #    LLM 生成业务数据
+│   └── generate_faker_data.py  #    Faker 生成海量数据
+├── templates/index.html        # ⑦ Web 前端页面（含全部前端逻辑）
+├── langgraph.json              #    LangGraph 服务配置（graph 工厂入口）
+├── requirements.txt / .env / env_example.txt
+└── README.md / README_LangGraph_CLI.md
+```
+
+### 分层调用关系
+
+```
+浏览器 (templates/index.html, 原生JS+SSE)
+   │  HTTP/JSON, SSE
+   ▼
+【Flask 进程】  app/web.py (路由)
+   │  调用
+   ▼
+【Flask 进程】  app/service.py (LangGraph 客户端, SSE 解析)
+   │  HTTP REST (langgraph_sdk / requests)
+   ▼
+【LangGraph 服务进程】  langgraph.json → app/graph.make_graph()
+   │  StateGraph: entry → supervisor → [clarify 循环] → 领域agent → final_response
+   ▼
+【图内】agents/* (BaseAgent._stream_llm)  ──get_stream_writer──▶ 推送 custom token 事件
+   │  RAG: retrieval/vector_store →(rerank)  |  Embedding: bge 中文模型
+   ▼
+【LLM】 OpenAI 兼容 API（openai-compatible client, core/config 注入）
+```
+
+---
+
+## 4. 核心概念：AgentState 状态
+
+整个工作流的状态由 `AgentState`（TypedDict）承载，见 `app/graph.py:49`：
+
+```python
+class AgentState(TypedDict):
+    session_id: str
+    messages: List[Any]
+    current_agent: str            # 当前处理智能体
+    customer_query: str           # 本轮用户查询
+    query_type: str               # 路由结果（supervisor 决策）
+    response: str                 # 最终回复
+    tools_used: List[str]         # 使用的工具记录
+    next_agent: str
+    conversation_history: List[Any]
+    memory: Optional[BaseChatMessageHistory]
+    persisted_dialogue: List[Any]   # 由 checkpointer 持久化的对话轮次（跨进程续聊的关键）
+    # —— Supervisor 澄清相关 ——
+    request_clarification: bool     # 是否需要反问
+    clarification_question: str     # 反问的问题
+    clarified_flag: bool            # 本轮是否已澄清（防死循环）
+    clarified_input: str            # interrupt 恢复值（用户补充的信息）
+    confidence: float               # 路由置信度
+```
+
+> 关键点：**对话历史不存内存**，而是存在 `persisted_dialogue` 字段里，依赖 LangGraph 的 **checkpointer** 持久化到 `.langgraph_api/` 序列化文件。这样跨 LangGraph 进程/服务重启都能续聊。
+
+### 对话历史有界化（窗口 + LLM 摘要）
+
+`persisted_dialogue` 不会无限增长。见 `app/graph.py:352`：
+
+- `WINDOW_ROUNDS = 12`：保留最近 12 轮；
+- `ARCHIVE_TRIGGER = 6`：超过 18 轮时，最旧的 6 轮被压缩成 LLM 中文摘要并入 `memory`（`_archived_summary`）；
+- `MAX_MEMORY_CHARS = 1600`：摘要体积封顶。
+
+```python
+def _append_turn(state, content, is_user):
+    pd = list(state.get("persisted_dialogue") or [])
+    pd.append({"content": str(content), "is_user": is_user,
+               "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+    memory = str(state.get("memory") or "").strip()
+    if len(pd) > WINDOW_ROUNDS + ARCHIVE_TRIGGER:
+        oldest = pd[:-WINDOW_ROUNDS]
+        new_summary = _archived_summary(join_lines(oldest))   # LLM 压缩
+        memory = (memory + "\n" + new_summary)[:MAX_MEMORY_CHARS]
+        pd = pd[-WINDOW_ROUNDS:]
+    state["persisted_dialogue"], state["memory"] = pd, memory or None
+    return state
+```
+
+领域智能体拿上下文时，就是 `memory`（长期摘要）在前 + `persisted_dialogue` 尾部窗口，见 `agents/base.py:26` 的 `_get_conversation_context`。
+
+---
+
+## 5. LangGraph 工作流（app/graph.py）
+
+### 图结构
+
+节点定义于 `make_graph()`（`app/graph.py:536`）：
+
+```
+entry ──▶ supervisor ──▶ (route_after_supervisor 条件边)
+             │                │
+             │ 需要澄清       │ 业务路由(query_type)
+             ▼                ├─ product_info     → product_agent ─┐
+           clarify            ├─ technical_support→ tech_agent   ─┤
+             │                ├─ billing          → billing_agent─┤──▶ final_response (结束点)
+             └──── 回到 supervisor（补充后重新路由）├─ complaint       → complaint_agent─┤
+                              ├─ general_inquiry  → general_agent─┘
+                              └─ out_of_scope     → final_response (固定护栏回复)
+```
+
+```mermaid
+flowchart LR
+    A[entry] --> B[supervisor]
+    B -->|request_clarification 且未澄清| C[clarify]
+    C --> B
+    B -->|product_info| PA[product_agent]
+    B -->|technical_support| TA[tech_agent]
+    B -->|billing| BA[billing_agent]
+    B -->|complaint| CA[complaint_agent]
+    B -->|general_inquiry| GA[general_agent]
+    B -->|out_of_scope| F[final_response]
+    PA --> F
+    TA --> F
+    BA --> F
+    CA --> F
+    GA --> F
+```
+
+### 各节点职责
+
+| 节点 | 函数 | 职责 |
+|------|------|------|
+| `entry` | `entry_node` | 初始化状态、把 `thread_id` 当 session_id、记录用户轮次、**越狱/无关关键词前置护栏** |
+| `supervisor` | `supervisor_node` | 构造上下文调用 `SupervisorAgent.decide()`，产出 `query_type` / 澄清决策；`out_of_scope` 直接给固定回复 |
+| `clarify` | `clarify_node` | `interrupt()` 挂起等用户补充；resume 后合并补充信息、置 `clarified_flag=True`，回 supervisor |
+| `product/tech/billing/complaint/general` | `create_agent_node(name)` | 调对应领域智能体处理 |
+| `final_response` | `final_response_node` | 给回复加 `【agent's Response】` 前缀 |
+
+### ① 入口 + 越狱护栏（app/graph.py:279）
+
+```python
+def entry_node(state: AgentState) -> AgentState:
+    ...
+    state = _append_turn(state, str(customer_query), True)   # 持久化用户轮次
+    # 前置护栏：规则快速拦截越狱/无关请求，不进 supervisor 与业务智能体
+    if _is_out_of_scope(customer_query):
+        state["query_type"] = "out_of_scope"
+        state["response"] = OUT_OF_SCOPE_REPLY            # 固定护栏话术
+        state = _append_turn(state, OUT_OF_SCOPE_REPLY, False)
+        return state
+    return state
+```
+
+`OUT_OF_SCOPE_KEYWORDS`（写诗/写小说/代码题/越狱/提示词/角色扮演/违法…）定义在 `agents/supervisor.py:46`。
+
+### ② 主管节点 + 条件路由（app/graph.py:465 / 529）
+
+```python
+def route_after_supervisor(state: AgentState) -> str:
+    if state.get("request_clarification") and not state.get("clarified_flag"):
+        return "clarify"
+    return state.get("query_type", "general_inquiry")
+```
+
+### ③ 澄清节点：interrupt/恢复（app/graph.py:510）
+
+```python
+def clarify_node(state: AgentState) -> AgentState:
+    user_input = interrupt({"question": state.get("clarification_question", "")})
+    state["clarified_input"] = str(user_input)
+    state["clarified_flag"] = True
+    state["customer_query"] = f"{state.get('customer_query')}（补充信息：{user_input}）"
+    state = _append_turn(state, str(user_input), True)
+    return state
+```
+
+`clarify → supervisor`（`graph.py:579`）形成循环：补充信息后 supervisor 重新决策（此时 `clarified_flag=True`，强制不再反问），随后路由到业务智能体。
+
+---
+
+## 6. 智能体层（agents/）
+
+### BaseAgent（agents/base.py）
+
+所有领域智能体继承它。核心三块：
+
+1. **上下文增强**：`_get_conversation_context` 拼"长期记忆摘要 + 最近 12 轮窗口"；`_enhance_system_prompt_with_context` 追加"结合历史、保持连贯"的指令。
+2. **流式 LLM 调用**：`_stream_llm`（`agents/base.py:63`）——若 LLM 支持 `invoke_stream`，逐 token 通过 `get_stream_writer()` 推 `{'agent': name, 'content': delta}`，LangGraph 会把它封装成 `custom` SSE 事件；失败则回退非流式。
+
+```python
+def _stream_llm(self, messages, agent_name=None):
+    name = agent_name or self.name
+    try:
+        from langgraph.config import get_stream_writer
+        writer = get_stream_writer()
+    except Exception:
+        writer = None
+    if hasattr(self.llm, "invoke_stream"):
+        parts = []
+        for delta in self.llm.invoke_stream(messages):
+            if delta:
+                parts.append(delta)
+                if writer is not None:
+                    writer({"agent": name, "content": delta})   # → custom 事件的关键
+        if parts:
+            return "".join(parts)
+    response = self.llm.invoke(messages)   # 非流式回退
+    ...
+```
+
+> 注意：`OpenAICompatibleClient` 是**自研 HTTP 客户端**（不是 langchain-openai 包），为兼容 langchain 消息对象做了格式转换，并带指数退避重试。`invoke`/`invoke_stream` 见 `app/graph.py:70-210`。
+
+### SupervisorAgent（agents/supervisor.py）
+
+**决策函数** `decide()`：优先 LLM 结构化输出，失败回退规则。
+
+LLM 通道（`_decide_by_llm`）：让模型输出 JSON
+```json
+{"route": "billing", "request_clarification": false,
+ "clarification_question": "请提供您的订单号", "confidence": 0.9}
+```
+`_normalize_decision` 容错解析：正则抽取 `{...}`，route 做规范化和模糊匹配，必须落在 `ROUTE_LABELS` 内（product_info / technical_support / billing / complaint / general_inquiry / out_of_scope）。
+
+规则回退（`_decide_by_rules`）：
+- `OUT_OF_SCOPE_KEYWORDS` 命中 → out_of_scope；
+- `RULE_KEYWORDS` 按中文关键词命中数排序取最高分领域；
+- 澄清判断：领域在 `CLARIFY_HINTS` 有追问项且 `len(query) < 8`（信息过短）时触发反问。
+
+### 领域智能体统一处理模式
+
+5 个领域智能体（product/tech/billing/complaint/general）结构完全一致，以 product 为例（`agents/product.py:22`）：
+
+```python
+def process(self, state):
+    customer_query = state["customer_query"]
+    conversation_context = self._get_conversation_context(session_id, state)  # 上下文
+    matched_products = self._search_products(customer_query)                 # ① RAG 检索
+
+    # ② 组装 SystemPrompt（角色+专业领域+上下文增强）+ 检索结果
+    messages = [SystemMessage(conversation_context), SystemMessage(base_prompt)
+                , HumanMessage(matched_products 或 customer_query)]
+
+    # ③ 流式调用 LLM，写回 state
+    response = self._stream_llm(messages, self.name)
+    state["response"], state["current_agent"] = response, self.name
+    state["tools_used"].append(f"{self.name}_processing")
+    return state
+```
+
+各智能体的检索差异只体现在 `_search_*` 调用与候选格式化上：
+
+| 智能体 | 检索方法 | 数据源 |
+|--------|----------|--------|
+| ProductAgent | `vector_store.search_products` | products |
+| TechAgent | `vector_store.search_tech` | tech_knowledge |
+| BillingAgent | `vector_store.search_billing` | billing_policies |
+| ComplaintAgent | `vector_store.search_complaint` | complaint_records |
+| GeneralAgent | `vector_store.search_service` | service_info |
+
+---
+
+## 7. RAG 检索层（retrieval/）
+
+### VectorStore（retrieval/vector_store.py）
+
+- **单例**（全局 `_vector_store`），`PersistentClient` 落盘到 `data/chroma_db/`，向量库构建一次后用 `check_collection_status()` 判断存在与否，避免重复编码。
+- **Embedding**：优先本地 `bge-large-zh-v1.5`（`LOCAL_EMBEDDING_MODEL`，路径需本机存在）；缺失则回退 TF-IDF（char n-gram）。TF-IDF 模式下检索时现算（`_search_tfidf`）。
+- **5 个 collection**：products / tech_knowledge / billing_policies / complaint_records / service_info。
+
+#### 差异化检索策略（`RETRIEVAL_STRATEGY`，vector_store.py:45）
+
+```python
+RETRIEVAL_STRATEGY = {
+    "products": "full_rag",         # 纯语义召回 + Rerank 精排
+    "tech_knowledge": "full_rag",   # 同上
+    "billing_policies": "hybrid",   # 向量 + 关键词，RRF 融合
+    "service_info": "hybrid",       # 同上
+    "complaint_records": "structured_first",  # 类别结构化过滤优先 + 向量兜底
+}
+```
+
+三种策略实现：
+
+1. **full_rag**：`_search_chromadb` 语义召回 top_k*3 候选（HNSW），再交 reranker 精排（`_search_chromadb`，vector_store.py:432）。
+2. **hybrid**：向量召回 + `TfidfVectorizer` 字符 n-gram 关键词召回（`_keyword_rank`），用 **Reciprocal Rank Fusion** 融合两个排序（`_rrf_fusion`，vector_store.py:547）。
+3. **structured_first**：query 命中 `STRUCTURED_FILTER_MAP` 里的类别关键词（如"退款"→退款政策）时，用 `where={"category": {"$in": [...]}}` 精确过滤 + 语义排序；无命中或失败则向量兜底（`_search_structured_first`，vector_store.py:578）。
+
+### Reranker（retrieval/rerank.py）
+
+`rerank()` 三级优先级：
+
+1. 本地 **Cross-Encoder**（`bge-reranker-base/large` 等，自动探测本地路径）——最准；
+2. **LLM 零样本重排**：让 LLM 输出相关性排序的 JSON 数组（`[3,1,2]`），`_parse_indices` 容错解析；
+3. 都不可用 → 按原始相似度排序。
+
+### DocumentLoader（retrieval/document_loader.py）
+
+支持把 md/pdf/txt 长文档加载 → `RecursiveCharacterTextSplitter`（中文友好分隔符）切分成带重叠的 chunk → 生成带 `source/chunk_index/doc_id/category` 元数据的向量入库单元。文件名关键词自动分类到对应 collection（`self_keyword_map`）。
+
+---
+
+## 8. 应用层（app/）
+
+### web.py：Flask 路由（app/web.py）
+
+| 路由 | 说明 |
+|------|------|
+| `GET /` | 主页，渲染 index.html |
+| `POST /api/chat` | 非流式聊天（含澄清），`run_chat_ext` |
+| `POST /api/chat/resume` | 澄清恢复，`resume_chat_ext` |
+| `POST /api/chat/stream` | **流式聊天**（SSE），`stream_chat_ext` |
+| `POST /api/chat/stream/resume` | 流式澄清恢复，`stream_resume_ext` |
+| `GET /api/sessions` | 会话列表（线程搜索 + 每条线程补查 state 拼装） |
+| `GET /api/sessions/<id>` | 会话详情（含对话历史） |
+| `DELETE /api/sessions/<id>` | 删除线程 |
+| `POST /api/sessions/<id>/clear` | 删旧线程并新建，实现"清空" |
+| `POST /api/new_session` | Flask session 侧新建会话（纯前端逻辑） |
+| `GET /api/health` | 健康检查 |
+| `GET /api/test` | LangGraph 连通性测试 |
+
+### service.py：LangGraph 客户端（app/service.py）
+
+关键函数：
+
+- `ensure_assistant_exists` / `ensure_thread_exists`：REST 搜索/创建 assistant 与 thread（线程 ID 即会话 ID，前端传 `session_id` 且为合法 thread_id 时复用，否则新建）。
+- `run_chat_ext`（阻塞）：用 `langgraph_sdk` 的 `client.runs.stream(stream_mode="updates")` 跑一轮，捕获 `__interrupt__` 事件 → 返回 `{status:'clarify', question, thread_id}`；否则从线程 state 提取 AI 回复 → `{status:'completed', response, thread_id}`。
+- `resume_chat_ext`：新 run 带 `command={"resume": resume_value}` 在同一线程续跑。
+- `stream_chat_ext`（**核心**，service.py:652）：`requests` 直连 `POST /threads/{tid}/runs/stream`，`stream_mode=["custom","updates"]`，用 `_parse_sse_stream` 解析：
+  - `custom` 事件 → 转发 `{type:"token", agent, content}`；
+  - `updates` 事件里含 `__interrupt__` → 转发 `{type:"clarify", question, thread_id}`；
+  - 结束发 `{type:"done"}` 和 `data: [DONE]`。
+  - 若全程无 token（如入口越狱拦截），回退读最终 state 补一条 token。
+
+### 会话历史解析（service.py:58）
+
+`conversation_history_from_state_data` 从线程 state 提取对话列表，优先级：
+`persisted_dialogue`（轮次含时间戳）→ `conversation_history` → `messages` → 兜底 `response`。这是侧栏预览、历史详情的统一数据源。
+
+---
+
+## 9. 一次完整对话的流程（综合视角）
+
+```
+用户输入
+  │
+  ▼
+[浏览器] fetch POST /api/chat/stream {message, session_id}
+  │
+  ▼
+[Flask web.py] chat_stream → stream_chat_ext
+  │  ensure_assistant_exists / ensure_thread_exists (复用或创建 thread)
+  │  请求: POST {LANGGRAPH_API_URL}/threads/{tid}/runs/stream
+  │        stream_mode=["custom","updates"]
+  ▼
+[LangGraph 服务] 执行 make_graph 工作流
+  ├─ entry:        记录用户轮次 + 越狱关键词护栏
+  ├─ supervisor:   SupervisorAgent.decide(query, context)
+  │   ├─ route=out_of_scope → 直接返回固定护栏回复
+  │   └─ request_clarification=true → clarify 节点 interrupt 挂起（SSE 推 clarify）
+  │       用户补充 → resume → clarify→supervisor（不再反问）→ 领域智能体
+  ├─ 领域智能体:   RAG 检索 → 组装 prompt → _stream_llm
+  │                 每增量 token → get_stream_writer → custom 事件
+  └─ final_response: 加前缀
+  ▼
+[custom 事件流] 经 /runs/stream 回到 Flask
+  │  _parse_sse_stream: custom→{type:token}; __interrupt__→{type:clarify}
+  ▼
+[浏览器] fetch reader 逐块解析 SSE，marked+DOMPurify 渲染；遇到 clarify 记录
+  pendingClarifyThread，下次发送改走 /api/chat/stream/resume
+  └─ 刷新会话列表（refreshSessionList）
+```
+
+### SSE 事件协议（项目自定义）
+
+| 事件 | 含义 |
+|------|------|
+| `{"type":"token","agent":"产品专家","content":"..."}` | LLM 增量输出 |
+| `{"type":"clarify","question":"...","thread_id":"..."}` | supervisor 反问 |
+| `{"type":"done","thread_id":"..."}` | 本轮结束（浏览器 finalizeBubble） |
+| `data: [DONE]` | HTTP 流结束标志 |
+
+---
+
+## 10. 数据层（data/）
+
+5 个业务 JSON 与对应 collection 一一对应，均为"对象数组"结构，字段见 `vector_store._prepare_items`（vector_store.py:232）：
+
+- `products.json`：id/name/brand/category/models/price_range/currency/features/target_audience/rating/sales_count/stock_status
+- `tech_knowledge.json`：id/category/issue/causes/solutions/prevention
+- `billing_policies.json`：id/category/policy/description/conditions/process/processing_days/refund_method
+- `complaint_records.json`：id/category/complaint_type/severity/customer_feedback/root_cause/solution/compensation/status/created_at/resolved_at
+- `service_info.json`：id/category/（service_channel|service_name）/（hours|value|description）/details/note
+
+当前仓库数据由脚本生成，体量约 1000+ 条/类（Faker 脚本 `generate_faker_data.py`）。
+
+---
+
+## 11. 脚本与数据生产（scripts/）
+
+| 脚本 | 作用 | 用法 |
+|------|------|------|
+| `build_db.py` | 强制重建并验证 ChromaDB 向量库 | `python scripts/build_db.py` |
+| `generate_data.py` | 用 LLM 生成 5 类业务数据到 data/*.json | `python scripts/generate_data.py` |
+| `generate_faker_data.py` | 用 Faker(zh_CN) 生成 1000~1200 条/类海量数据 | `python scripts/generate_faker_data.py` |
+
+建库流程：`scripts/build_db.py → init_vector_store(rebuild=True) → VectorStore.index_all()` 逐 collection 编码落盘；之后运行时 `get_vector_store()` 若检测到已有数据则直接加载。
+
+---
+
+## 12. 配置与环境变量
+
+`.env`（模板见 `env_example.txt`）：
+
+```dotenv
+OPENAI_API_KEY=<硅基流动 key>
+OPENAI_BASE_URL=https://api.siliconflow.cn/v1
+OPENAI_MODEL=Qwen/Qwen3-8B
+HTTP_TIMEOUT=30
+HTTP_MAX_RETRIES=3
+LOG_LEVEL=INFO
+FLASK_PORT=5000
+FLASK_DEBUG=False
+FLASK_SECRET_KEY=...
+# 可选
+LANGGRAPH_API_URL=http://127.0.0.1:2024
+LANGGRAPH_GRAPH_NAME=customer_service
+```
+
+加载逻辑集中在 `core/config.py`。`app/service.py` 里 `LANGGRAPH_API_URL` 默认 `http://127.0.0.1:2024`（LangGraph dev 服务端口）。
+
+`langgraph.json`：`graphs.customer_service = app/graph.py:make_graph`，env 指向 `.env`，python_version 3.11。
+
+> ⚠️ Windows 注意：`.env` 需 UTF-8（或纯 ASCII 注释）否则 `langgraph dev` 加载会 UnicodeDecodeError。
+
+---
+
+## 13. 部署与运行（两种模式）
+
+**方式 A：只 LangGraph（Studio/API）**
+```bash
+langgraph dev        # 默认 2024 端口，自动拉起 LangSmith Studio
+```
+
+**方式 B：Web 完整模式（两个终端）**
+```bash
+# 终端1: LangGraph 服务
+langgraph dev
+# 终端2: Flask Web
+python -m app.web    # 访问 http://localhost:5000
+```
+
+自检图结构：`python app/graph.py`（打印节点列表）。
+
+---
+
+## 14. 前端要点（templates/index.html）
+
+- 单文件 HTML，样式（CSS 变量主题）+ 逻辑全内联。
+- 流式渲染：`fetch` + `response.body.getReader()` 读取 SSE，按 `\n\n` 切块解析 `data:` 行（`handleBlock`，index.html:1956）。
+- Markdown 安全渲染：CDN 引入 `marked` + `DOMPurify`，失败时回退 textContent。
+- 澄清交互：`pendingClarifyThread`（index.html:1344）记录待恢复线程，收到 `clarify` 事件后，下一次发送改走 `/api/chat/stream/resume` 并携带 `thread_id + answer`（index.html:2000）。
+- 会话管理：加载侧栏列表（GET /api/sessions）、切换会话（GET /api/sessions/:id）、删除/清空、新建、数据导出走会话详情。
+- 智能体标识：`token` 事件里的 `agent` 字段 → 气泡上方显示"🤖 产品专家"（index.html:1948）。
+
+---
+
+## 15. 扩展指南（如何加东西）
+
+1. **加领域智能体**：`agents/` 新建类继承 `BaseAgent` 实现 `process` → `agents/__init__.py` 导出 → 数据准备一个 collection → 在 `make_graph()` 增加节点 + 条件边（route 标签）→ `agents/supervisor.py` 的 `ROUTE_LABELS` 增加标签。
+2. **加检索数据源**：`data/` 放 JSON → `vector_store` 增加 collection 与 `_prepare_items` 分支 → 可选 `RETRIEVAL_STRATEGY` / `STRUCTURED_FILTER_MAP` 配置策略 → `build_db.py` 重建。
+3. **加工具函数**：`core/tools/` 用 `@tool` 装饰器，`__init__.py` 导出。
+4. **换 LLM 服务商**：改 `.env` 的 `OPENAI_BASE_URL` + `OPENAI_MODEL`（任何 OpenAI 兼容接口）。
+5. **改造流程**：多数改动只需动 `app/graph.py` 的节点/边/`AgentState` 字段。
