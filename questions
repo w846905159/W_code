@@ -1,0 +1,99 @@
+# 面试口述版（三题自答）
+
+---
+
+## Q1：会话恢复优化 + 磁盘回收 + 数据可靠性
+
+**恢复提速那 72% 怎么来的？**
+我做了"快照 + 偏移指针"的加速方案。`state.json` 里存的不是整个 Agent 上下文，是三样东西：LLM 压缩留下的摘要、压缩时保留的最近几轮逐字消息尾巴、以及一个字节偏移——它指向日志文件里"压缩边界之后新消息开始"的位置。恢复的时候走快路径：读一个小 JSON 文件 + 用 FileChannel 按偏移只读尾部，拼成"摘要 + 尾巴 + 后续消息"就重建出会话，完全不用重解析压缩前那堆超大的 JSONL 转写。串行化开销其实可忽略，因为这个小文件只在压缩发生时写一次、恢复时读一次，重量主要省在"不用全量重放"。而且这条快路径挂了会自动回退到全量重建，不丢数据。
+
+**回收策略呢？**
+阈值是写死的 30 天、上限 200 个会话，后台守护线程每 6 小时扫一轮。是物理删除，四个文件一起删：转写、file-history 备份、meta 索引、快照。防误删靠的是 mtime 而不是 id 时间戳——正在进行的会话每写一条消息 mtime 就刷新，所以既不会超 30 天、又排在最前面进不了淘汰名单。不过老实说，这里没有显式的"活动会话锁"，一个恢复后闲置超过 30 天的旧会话还是会被清理，是我承认的一个边界缺口。
+
+**遥测落盘的一致性**
+这个问题我要说实话：目前做不到崩溃不丢，是 best-effort、丢数据就丢数据的设计。用一个 1024 容量的队列加单个写线程，每秒落盘一次。写入用的是非阻塞 offer，队列满了直接丢弃，没重试、没校验、没有 WAL。进程被杀，在队列里的最多一千条就这么没了；只有优雅关闭才会把剩余事件排空落盘。如果你要的是"生产级不丢埋点"，这个说法跟现状不符，要上顺序 flush 或者持久化缓冲才能做到。
+
+---
+
+## Q2：规则冲突 + 记忆召回效率
+
+**统计规则和 LLM 规则冲突怎么办？**
+坦诚讲：没有显式仲裁，靠的是"家族隔离 + 置信度阈值"隐式共存。统计规则用 `A->B` 工具对做 id，LLM 规则用"触发词::动作"散文做 id，两个命名空间根本不互相覆盖；而且 LLM 候选只会去强化已经被标记为 ai 来源的规则，不会反向去加强统计规则；聚类也只在同族内做。注入时统一按置信度 0.65 门槛过滤、按领域分组输出，不按来源分权重。唯一例外是用户手动 `/rule`，直接给满置信度，永远注入，这算事实上的最高优先级。
+给你举个真实 case：git 提交流程——统计路径看到三次"git status -> git commit"生成 `Bash->Bash`，置信度 0.8；另一边 LLM 从观察摘要提取出"commit 之前先跑 status"的散文规则，初始 0.5。两条语义相同，但因为不跨族强化，最终会同时注进上下文，产生重复引导。这是我明确知道的设计代价。
+
+**记忆召回性能**
+这里容易答错，我纠正一下：跨会话记忆召回**既不是向量库也不是关键词匹配**，而是"选择器 LLM 读清单"——把每条记忆抽成 name+description 清单，旁路调一次 LLM 从清单里挑最多 5 个最相关的名字，再读全文注入。设计上就是刻意不用向量的。所以 20 万量级的 QPS 瓶颈在**一次 LLM 侧查的网络延迟**和一个会话内的目录扫描，不在"索引"。为了避免堵主流程，召回全部跑在虚拟线程里，8 秒硬超时中断，主链路只等 3 秒，超时就直接丢掉这次的召回。
+真正用 HNSW 向量的是另一个东西：RAG 工具，Lucene 9 的 HNSW + 余弦，但参数全是默认值，没做调优，而且每个 chunk 插入都独立 commit，每次查询都要开新 reader，这两处是性能隐患。20 万规模的压力测试数据我没有，不编。
+
+---
+
+## Q3：Skill 编排
+
+**fork 模式的资源隔离和熔断**
+要先澄清：fork **默认不是独立进程**，是虚拟线程。隔离体现在三个维度——独立的会话上下文、经 6 层过滤的新工具注册表、skill 声明的 allowed_tools 白名单既藏 schema 又在执行期硬拦截；文件系统层面可选 git worktree 隔离，但那只是 FS 隔离，不是 CPU 或内存隔离。
+熔断是三层协作式防护：迭代上限默认 200 轮、墙钟 30 分钟总超时、再加工具自身超时兜底。到点就调 Agent 的 cancel，本质是 interrupt 协作式中断，因为虚拟线程没法强杀。所以我要把话说清楚：**守住的是轮数失控和总时长超限，守不住真正的内存泄漏**——没有 per-skill 的堆预算，中断也是协作式的。面试里敢这么承认边界，比硬吹强。
+
+**热加载怎么保证正在执行的 Skill 不受影响？**
+不用类加载器隔离，因为 Skill 根本是**数据**不是代码——yaml 加 markdown，不存在类加载域问题。实现上是双保险：正文内容每次取用时重新读盘，所以改文件立即生效，不需要监听器；监听器只负责目录级的增删，300ms 防抖后重建目录。关键在"激活即快照"：inline 模式在激活那一瞬间把提示词拷进 Agent 的字段里，fork 模式在拉起子会话前就烘焙进上下文了，之后盘上怎么改都影响不到这次执行，下次触发才拿到新版本。所以哪怕目录被删，正在跑的 Skill 照常结束，顶多下次菜单里没了。
+
+基于源码，Q4–Q7 面试口述版如下。
+
+---
+
+## Q4：LLM 客户端抽象
+
+**流式事件怎么统一？**
+我定义了一个密封接口 `StreamEvent`（`llm/StreamEvent.java`），把协议差异全部收敛成有限几种事件：`TextDelta / ThinkingDelta / ThinkingComplete / ToolCallStart / ToolCallDelta / ToolCallComplete / StreamEnd / Error`。每个客户端在自己的虚拟线程里把原生流翻译成这套事件，然后塞进容量 64 的有界队列，Agent 侧根本不知道底层协议。
+
+具体映射：Anthropic 端把 `content_block_start/delta/stop` + `message_start/message_delta` 分别翻译成文本、思考块、`tool_use` 生命周期和最终 usage/stop_reason；OpenAI Responses 端把 `output_text_delta` 变文本、`reasoning_summary_text_delta` 变思考；SSE compat 端最烦，`tool_calls` 的 id/name/arguments 是**按 index 分片下发**的，我按 index 累计，名字到位才发 `ToolCallStart`，arguments 到位发 Delta，`[DONE]` 时统一 flush 并只发**一个** `StreamEnd`。usage 和 stop reason 也都做归一化：input/output/cacheRead/cacheCreation 四元组 + `end_turn/max_tokens`。
+
+**429/500 的重试策略？**
+错误先经 `classifyError` 归成 `LlmException` 层级：Auth / RateLimit / ContextTooLong / Network。重试动作集中在 Agent 循环（`agent/Agent.java:430-459`）：
+- **429**：固定等 5 秒重试，无限次——**没有指数退避，也没有尊重 `Retry-After` 头**，这点我要坦白；
+- **上下文超长**：`ContextCompactor.forceCompact` 硬压缩重试，上限 3 次；
+- **max_tokens**：第一次把输出上限升到 64K 天花板，之后再做有界恢复；
+- **500/其它错误**：直接 break 放弃，**不重试**。
+
+一句话总结：重试策略是"固定的、按错误类型定制的"，不是通用指数退避。
+
+---
+
+## Q5：MCP 渐进式加载
+
+**"仅传名字、按需加载"的真相**
+注册时 MCP 工具其实把**完整 schema 解析后放在内存 registry** 里了（`McpManager.McpToolWrapper`）；设计真正做的是：`ToolRegistry.getAllSchemas` 会把"deferred 且未 discovered"的工具**整个跳过**，schema 根本不进发给 LLM 的 tools 数组；上下文里只放一行**名字清单**系统提醒（`agent/Agent.java:287-298`），让模型知道"有这些工具，要用先 `ToolSearch select:名字` 把 schema 拉进来"。ToolSearch 命中后 `markDiscovered`，**下一轮**请求才带全量 schema。所以准确说法是："完整 schema 在内存在手，但永不进请求体，只给 LLM 名字 + 按需激活的开关。"
+
+**80% 怎么算的？**
+我要诚实：**代码里没有这个数字的测算或基准**。合理的计算口径也不是"System Prompt token 减少"——Anthropic/OpenAI 的 tools 数组是**每请求体的一部分**，既计入计费 input token、又占 prompt-cache 前缀长度。80% 大概是"减去所有 MCP schema 后的 input token 降幅"，但没有实测佐证。真要给出数字，得按 schema 的 JSON 字节 / 拆分开销逐条算。被追问时我会直说这是设计收益而非测量得到的数字。
+
+**首次调用的延迟？**
+关键点：**发现本身零网络开销**——MCP schema 在启动时后台连接阶段 `listTools` 就拿回来缓存在 wrapper 内存里了，ToolSearch 只是内存查 registry 再返回 JSON。真正的额外开销是"**多一轮往返**"：模型得先 ToolSearch 一次、下轮才能调用该工具。**没有做黑名单之外的预取**，缓存就两级：wrapper 内存里的 `sdkTool` + 已发现的集合。
+
+---
+
+## Q6：两层压缩引擎
+
+**摘要的成本控制**
+是，Layer2 用主 LLM 侧查生成。成本控制有三点：一是喂给摘要 LLM 的前缀先 `serializeForSummary`，**单条工具结果截到 500 字符**（`ContextCompactor.java:679`），海量内容不会全量进摘要请求；二是 `SUMMARY_OUTPUT_RESERVE=20_000`，从有效上下文窗口里专门给摘要响应预留空间（:47）；三是保留逐字尾巴 1 万 token 或至少 5 条消息（`KEEP_RECENT_TOKENS` / `MIN_KEEP_MESSAGES`，:68-69）——全局摘要 + 局部原文，避免全量信息丢失。摘要本身没有硬性输出 token 上限，靠 system prompt 约束。
+
+**摘要丢关键逻辑怎么检测？**
+**没有自动化检测**，这个我不能吹。缓解靠三道保险：
+1. **逐字保留最近轮**，压缩只针对旧前缀；
+2. **恢复附件**：`RecoveryState` 把最近读过的文件、激活技能、可用工具清单挂回摘要消息后面（:503），并显式指示模型"重读源文件，别靠摘要猜"（:596-598）；
+3. 摘要消息里带**完整会话 jsonl 路径**，随时可按需回读原文。
+所以用的是"可追溯 + 不猜原文"的降险手段，不是检测手段。
+
+**UsageAnchor "锚定"具体指什么？**
+不是逐 step 记 token。它是**每轮流结束后用 provider 上报的真实用量重设基线**（:236）：`baseline = input + cacheRead + cacheCreation + output`，同时记下当时的消息数 `anchorCount`。之后的估算 = baseline + 锚点之后**新增消息**的字符估算。冷启动没有锚点时退化为全量字符估算。价值在于：**prompt cache 命中时真实 input 远小于字符估算**，纯字符估算会把已缓存的上下文重复算一遍导致过早触发压缩，锚定纠正了这个误差。
+
+---
+
+## Q7：Multi-Agent 与 Git Worktree
+
+**性能开销**
+是的，**同步执行的子代理每次都新建 worktree**：每次随机生成 `agent-a<7hex>` slug，跑一个 `git worktree add -B <branch> <path> HEAD` 子进程（`worktree/AgentWorktree.java:47`）。因为是同仓库，**没有对象拷贝**，代价只是 git 子进程启动（约 100–300ms）；结束判定时再跑 `status --porcelain` + `rev-list` 一两次，有改动就保留 worktree、无改动就 `worktree remove` + `branch -D`，**每次任务大约 3–5 次 git 子进程调用**。高频并行时 git 的 lock 文件会让并发的 add/remove 轻微串行化；**没有做池化复用**（fast-resume 只对同 slug 路径已存在时复用，而 sync 代理 slug 每次唯一）。`StaleCleanup` 后台按三层安全过滤定时回收过期临时 worktree（`worktree/StaleCleanup.java:45`）。
+
+**冲突合并怎么处理？**
+**没有自动三方合并**。子代理各自从同一 HEAD 检出的独立工作树里改，文件系统层面天然隔离、**不会发生 git 意义上的冲突**；"合并"其实是由主 Agent 用工具逐个读回每个保留 worktree 的改动、在提示词层面自行裁决的——`Coordinator.java:19` 注释原话就是 *"Lead verifies results and resolves conflicts"*，即 **LLM 主导的人工式合并**。
+
+没有自动 git merge/rebase，也就不存在"自动回滚"——所有改动都隔离在各自的 worktree 里，判定规则是 **fail-closed**：`WorktreeChanges.hasChanges` 返回有改动 → worktree 保留并报路径给主代理；查不出状态也按"有改动"处理，只有确认干净的才删除。多代理同时改同一文件的不同部分时，就是主 Agent 逐个 diff 后自己决定怎么整合，不做行级自动合并。
