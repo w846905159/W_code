@@ -79,3 +79,146 @@ Spawn时: drainTeammateEvents → SubAgentProgress"teammate"(通道C)
 > **真正"agent 间传播消息"的只有两条**：`FileMailBox`（协调，跨进程，成员互发）+ `SubAgentTaskManager.notifications`（主从后台，任务完成上报）。而这两条**最终都汇进父 Agent 唯一的 `notificationFn`（通道B）变成系统提醒**。`SubAgentProgress` 和 `TeammateProgress` 根本不是 agent 间消息，只是 UI 展示的载体。`AgentEvent` 队列则是所有模式共享的"Agent 自身心跳"底座。
 
 所以不是"很多套消息系统"，而是 **一套跨进程 Mailbox + 一套进程内任务通知，都灌进父模型的同一根通知管，外加两套 UI 展示载体**——这就是全部。
+
+
+
+
+
+
+协调模式：：
+
+读完关键代码,给你一个**端到端的完整示例**。先点明协调模式的本质:**它不是开关命令,而是"状态驱动"的**——只要 `TeamManager` 里存在任意一个队伍,Lead 主 Agent 的工具就自动被收紧成协调工具集。
+
+```java
+// MewCodeModel:585-588
+agent.setToolNameFilter(name ->
+        teamMgrCapture.listTeams().isEmpty()      // 无队伍 → 不限制
+            ? true
+            : Coordinator.isCoordinatorTool(name)); // 有队伍 → 只留协调工具
+```
+
+`Coordinator.ALLOWED_TOOLS` = `{Agent, SendMessage, TaskCreate/Get/List/Update, TeamCreate, TeamDelete, ReadFile, Glob, Grep, Bash}`——**没有 WriteFile/EditFile**。也就是说:队伍一落地,Lead 就不能再亲手改代码,只能"指挥 + 只读研究 + 跑命令"。
+
+---
+
+## 场景:让 3 个 Agent 协同重构 `src/agent` 模块
+
+用户对主 Agent(后面称 **Lead**)说:"用团队方式重构 agent 模块,一个探索 API、一个写实现、一个补测试。"
+
+### Step 1 Lead 创建队伍(协调模式在此刻自动"解锁")
+
+Lead 本回合工具还是全量,它调用:
+
+```
+TeamCreate({ team_name: "refactor-squad", description: "重构 agent 模块" })
+```
+
+```java
+// TeamCreateTool.execute → TeamManager.detectBackend()=IN_PROCESS
+TeamManager.Team team = teamMgr.createTeam("refactor-squad", mode);
+// Team 内含 FileMailBox: .mewcode/teams/refactor-squad/inboxes/
+```
+
+**从这个 turn 结束起,`listTeams()` 非空,Lead 下一轮的工具就被 `Coordinator` 过滤收窄。**
+
+### Step 2 Lead 先自己做只读研究 + 拆任务
+
+Lead 用 `ReadFile/Grep/Glob` 探查,然后建立**共享任务清单**(`SharedTaskStore`,带 `blocks/blockedBy` 依赖):
+
+```
+TaskCreate({ name: "探索 Agent 公共API", blocks: [] })
+TaskCreate({ name: "重构核心循环",       blocks: ["探索 Agent 公共API"] })
+TaskCreate({ name: "补重构测试",         blocks: ["重构核心循环"] })
+```
+
+### Step 3 Lead 派发队友(关键一步:必须带 team_name)
+
+```
+Agent({
+  team_name: "refactor-squad",
+  name: "explorer",
+  prompt: "探索 com.mewcode.agent 的公共 API,输出依赖清单到 lead。",
+  description: "API 探索员"
+})
+```
+
+当 Lead 调用这个 `Agent` 工具时走的是 `AgentTool.runAsTeammate`,内部链路:
+
+```
+runAsTeammate
+ ├─ 1. ToolFilter.filterForAgent(...) 构建受限注册表
+ │      (in-process 队友额外放行 Task*/SendMessage;无 WriteFile?→ 需再确认,但至少专用工具会注入)
+ ├─ 2. subRegistry.register(new SendMessageTool(teamMgr, "explorer"))   ← 每个成员一套专属"发信工具",sender 绑定自己
+ ├─ 3. buildTeammateAddendum(...)：
+ │      "你是 team refactor-squad 的成员,名叫 explorer;lead 可用 SendMessage 联系;队友有 xxx"
+ │      → 作为 system-reminder 塞进该成员会话
+ └─ 4. SpawnDispatcher.spawnTeammate
+        └─ IN_PROCESS → InProcessBackend.startInProcessMember
+             ├─ team.addMember(explorer)           // 登记进 Team.members
+             └─ Thread.ofVirtual().start(() -> TeammateRunner.runInProcessTeammate(...))
+```
+
+**队友一登台就进入自己的 4 步生命周期循环**(TeammateRunner.java:58-92):
+
+```java
+while (!interrupted) {
+    1. injectPendingMessages(team, name)   // 未读收件箱 → 折叠成 system-reminder
+    2. if (nextPrompt != null) member.conv.addUserMessage(nextPrompt)   // 首轮=initialPrompt
+    3. member.agent.run(member.conv)       // 跑一整轮到 LoopComplete(事件经 eventOut 转发给 UI)
+    4. team.sendMessage(me, "lead", idle通知, IDLE)   // 向 lead 报"空闲"
+    5. waitForNextPromptOrShutdown(...)    // 500ms 轮询;TASK 消息唤醒;收到 [shutdown] 退出
+}
+```
+
+以此类推,Lead 再 `Agent({team_name, name:"implementer", prompt:...})` 和 `Agent({team_name, name:"tester", ...})` 派两个队友。
+
+### Step 4 队友干活与异步通信(全部走文件邮箱)
+
+- 队友中途要信息:`SendMessage({to:"lead", content:"探索到 5 个公共类,详见...", kind:"notice"})` → `FileMailBox` 写入 lead 的 inbox(`kind:"notice"` 不唤醒闲置者,只是备忘)。
+- 队友交活:`SendMessage({to:"lead", content:"implementer 完成核心重构,...", kind:"task"})` → **`kind:"task"` 会唤醒闲置状态的 lead**。
+- **Lead 怎么看到**:每轮 `agentLoop` 开头 `notificationFn.get()`(MewCodeModel:576-582)→ `TeammateRunner.drainLeadMailbox(teamMgr)` 把各队 lead 收件箱未读消息折叠成:
+
+```
+<team-notification team="refactor-squad">
+from=explorer: xxx
+from=implementer: xxx
+</team-notification>
+```
+上回合结束后 TUI 还有 2s 一次的 `MailboxPollMessage` 轮询触发新一轮唤醒(1428)。
+
+### Step 5 Lead 汇总、再下指令、验证
+
+Lead 看到 `<team-notification>` → 决定下一步:改需求 → 再 `Agent`/`SendMessage` 到对应成员(`kind:task` 唤醒);检查质量 → 用只读工具 + 让 tester 跑测试回报;有冲突 → `SendMessage` 协调。
+
+### Step 6 收尾:`TeamDelete` 一键停机 + 协调模式自动解除
+
+```
+TeamDelete({ team_name: "refactor-squad" })
+```
+```java
+// TeamManager.deleteTeam → team.stopAll()
+for (member : members) inbox 追加 "[shutdown]"   // TeammateRunner: 收到 → break 循环 → member.active=false
+```
+
+**`listTeams()` 变空 → `Coordinator` 过滤自动解除,Lead 恢复全量工具**(WriteFile/EditFile 回来了),可以继续亲手收尾。
+
+---
+
+## 一图流
+
+```
+用户: 组个队重构
+   │
+[Lead] TeamCreate refactor-squad ──◆ 此刻起 Lead 工具 → Coordinator 白名单
+   │     TaskCreate×3(共享清单)
+   │     Agent(team_name, explorer) ─▶ 虚线程起 TeammateRunner
+   │     Agent(team_name, implementer) ─▶ 虚线程
+   │     Agent(team_name, tester) ─▶ 虚线程
+   │       └─ 各自循环: 收信→干活→发IDLE→休眠
+   │  ▲                            │ SendMessage→lead inbox
+   └──┴─ notificationFn 每轮折叠成 <team-notification> 注入 Lead
+         汇总/协调 → 再 task 唤醒指定队友
+   TeamDelete ──◆ Team 数归零 → Lead 恢复全量工具
+```
+
+**核心要点**:协调模式 = "存在队伍即自动限制 Lead 为协调者";队友 = 独立的 `TeammateRunner` 生命周期;通信 = 文件邮箱(进程内外一致);唤醒 = `kind:task` 消息 + Lead 侧 `notificationFn/MailboxPoll`;收尾 = `TeamDelete` 触发各成员 `[shutdown]`。四阶段(研究→综合→执行→验证)就是 Lead 在协调工具集内偏好遵循的工作流,写在 `Coordinator` 的 javadoc 里。
